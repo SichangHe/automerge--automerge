@@ -1,0 +1,410 @@
+=== SyncDoc::generate_sync_message
+--- original sync.rs generate_sync_message
++++ verus/conform.rs generate_sync_message
+@@ -1 +1,14 @@
+-fn generate_sync_message(&self, sync_state: &mut State) -> Option<Message> {
++pub fn generate_sync_message(&self, sync_state: &mut State) -> (r: Option<Message>)
++requires a_wf(*self), st_wf(*old(sync_state), *self), gen_frag(*old(sync_state)),
++ensures
++st_wf(*final(sync_state), *self),
++exists|bloom: ISet<int>| {
++&&& a_doc(*self).difference(M::closure(a_deps(*self), a_n(*self), vset(old(sync_state).shared_heads@))).subset_of(bloom)
++&&& abs_peer(*self, *final(sync_state)) == M::gen(a_deps(*self), a_n(*self), abs_peer(*self, *old(sync_state)), bloom, true).0
++&&& gen_msg_ok(abs_peer(*self, *old(sync_state)), r, M::gen(a_deps(*self), a_n(*self), abs_peer(*self, *old(sync_state)), bloom, true).1)
++},
++{
++let ghost s0 = *sync_state;
++let ghost d = a_deps(*self);
++let ghost n = a_n(*self);
++let ghost p = abs_peer(*self, s0);
+@@ -2,0 +16,2 @@
++// CHANGE [C19]: `vec![]` needs a type; `missing_deps_from(sync_state.their_heads.iter().flatten().copied())`
++// is `missing_deps_from(&sync_state.their_heads)` (see C7).
+@@ -4 +19,2 @@
+-vec![]
++let v: Vec<ChangeHash> = Vec::new();
++v
+@@ -6,10 +22 @@
+-// Only request what we need to reach the peer's advertised heads. This is
+-// deliberately not `get_missing_deps`, which reports the missing dependencies of
+-// _every_ queued change: the queue can contain orphans picked up from another peer
+-// (or an interrupted sync) whose dependencies this peer does not have. Advertising
+-// those blocks the sync — this peer can never satisfy the request and, because we
+-// withhold our `have` until everything we need is in the peer's advertised heads,
+-// the peer never sends us the unrelated changes it _does_ have. We still pick the
+-// orphans' dependencies back up if we later sync with a peer whose heads depend on
+-// them.
+-self.missing_deps_from(sync_state.their_heads.iter().flatten().copied())
++self.missing_deps_from(&sync_state.their_heads)
+@@ -17,6 +24,2 @@
+-let their_heads_set = if let Some(ref heads) = sync_state.their_heads {
+-heads.iter().collect::<HashSet<_>>()
+-} else {
+-HashSet::new()
+-};
+-let our_have = if our_need.iter().all(|hash| their_heads_set.contains(hash)) {
++// CHANGE [C10]: the HashSet `their_heads_set` and `.all(..)` replaced by `all_in_opt`.
++let our_have = if all_in_opt(&our_need, &sync_state.their_heads) {
+@@ -27,8 +30,23 @@
+-if let Some(ref their_have) = sync_state.their_have {
+-if let Some(first_have) = their_have.first().as_ref() {
+-if !first_have
+-.last_sync
+-.iter()
+-.all(|hash| self.has_change(hash))
+-{
+-return Some(Message::reset(our_heads));
++let ghost bloom = if our_have@.len() > 0 { bloom_set(our_have@[0].bloom) } else { ISet::new(|x: int| true) };
++assert(a_doc(*self).difference(M::closure(d, n, vset(s0.shared_heads@))).subset_of(bloom));
++assert(vset(our_need@) == M::missing(d, n, a_doc(*self), a_queue(*self), abs_opt_set(s0.their_heads)));
++assert(abs_haves(our_have@) =~= (if vset(our_need@).subset_of(abs_opt_set(s0.their_heads)) {
++seq![M::Have { last_sync: vset(s0.shared_heads@), bloom: bloom }] } else { Seq::empty() }));
++// CHANGE [C24]: `if let Some(first_have) = their_have.first().as_ref()` -> length test and index 0;
++// `.all(|hash| self.has_change(hash))` -> `has_all` (C11).
++if let Some(their_have) = &sync_state.their_have {
++if their_have.len() > 0 {
++if !self.has_all(&their_have[0].last_sync) {
++assert(M::must_reset(p));
++let ghost oh = M::heads(d, a_doc(*self));
++let ghost our_heads_s = our_heads@;
++let rm = Message::reset(our_heads);
++assert(vset(rm.need@) == ISet::<int>::empty()) by { assert(vset(rm.need@) =~= ISet::<int>::empty()); }
++assert(vset(rm.have@[0].last_sync@) == ISet::<int>::empty()) by { assert(vset(rm.have@[0].last_sync@) =~= ISet::<int>::empty()); }
++assert(abs_haves(rm.have@) =~= seq![M::Have { last_sync: ISet::empty(), bloom: ISet::empty() }]);
++assert(vset(rm.heads@) == oh);
++let r = Some(rm);
++assert(abs_peer(*self, *sync_state) == M::gen(d, n, p, bloom, true).0);
++assert(gen_msg_ok(p, r, M::gen(d, n, p, bloom, true).1));
++assert(st_wf(*sync_state, *self));
++return r;
+@@ -37,0 +56,3 @@
++assert(!M::must_reset(p)) by {
++if let Some(h) = p.their_have { if h.len() > 0 { assert(h[0].last_sync == vset(s0.their_have->Some_0@[0].last_sync@)); } }
++}
+@@ -39,3 +60 @@
+-// The remote peer is read-only and will ignore incoming changes.
+-// Skip computing and sending changes to save bandwidth.
+-MessageBuilder::new(vec![], sync_state)
++MessageBuilder::new(Vec::new(), sync_state)
+@@ -44 +63 @@
+-let hashes = self.change_graph.get_hashes(&[]);
++let hashes = self.change_graph.get_hashes(&Vec::new());
+@@ -50,5 +69,3 @@
+-// deduplicate the changes to send with those we have already sent and clone it now
+-let hashes: Vec<_> = all_hashes
+-.into_iter()
+-.filter(|hash| !sync_state.sent_hashes.contains(hash))
+-.collect();
++proof { lemma_hts_subset(d, n, a_doc(*self), abs_haves(their_have@), vset(their_need@)); }
++// CHANGE [C13]: filter/collect replaced by `filter_unsent`.
++let hashes: Vec<_> = filter_unsent(all_hashes, &sync_state.sent_hashes);
+@@ -56,2 +73 @@
+-// sending more than a 1/3 of the document?  send everything
+-let all_hashes = self.change_graph.get_hashes(&[]);
++let all_hashes = self.change_graph.get_hashes(&Vec::new());
+@@ -60 +76,2 @@
+-let changes = self.get_changes_by_hashes(hashes.iter().copied()).ok()?;
++// CHANGE [C20]: `.ok()?` -> match (the Err arm is excluded by T9).
++let changes = match self.get_changes_by_hashes(&hashes) { Ok(c) => c, Err(_) => return None };
+@@ -65 +82 @@
+-MessageBuilder::new(vec![], sync_state)
++MessageBuilder::new(Vec::new(), sync_state)
+@@ -67,2 +84,25 @@
+-let heads_unchanged = sync_state.last_sent_heads == our_heads;
+-let heads_equal = sync_state.their_heads.as_ref() == Some(&our_heads);
++let ghost send = M::send_set(d, n, p);
++assert(mb_cset(message_builder) == send && vset(mb_hashes(message_builder)) == send) by {
++assert(abs_haves(s0.their_have->Some_0@) =~= abs_haves(s0.their_have->Some_0@));
++}
++let heads_unchanged = vec_eq(&sync_state.last_sent_heads, &our_heads);
++proof {
++if heads_unchanged { assert(vset(s0.last_sent_heads@) == vset(our_heads@)); }
++else if vset(s0.last_sent_heads@) == vset(our_heads@) { lemma_sorted_eq(s0.last_sent_heads@, our_heads@); }
++}
++// CHANGE [C23]: `their_heads.as_ref() == Some(&our_heads)` -> match.
++let heads_equal = match &sync_state.their_heads { Some(h) => vec_eq(h, &our_heads), None => false };
++proof {
++if let Some(h) = s0.their_heads {
++if vset(h@) == vset(our_heads@) { lemma_sorted_eq(h@, our_heads@); }
++assert(heads_equal == (h@ == our_heads@));
++if h@ == our_heads@ { assert(vset(h@) == vset(our_heads@)); }
++}
++assert(heads_equal == (p.their_heads == Some(M::heads(d, a_doc(*self)))));
++}
++let ghost empty_b = (mb_hashes(message_builder).len() == 0);
++assert(empty_b == (send == ISet::<int>::empty())) by {
++if send == ISet::<int>::empty() {
++if mb_hashes(message_builder).len() > 0 { assert(vset(mb_hashes(message_builder)).contains(mb_hashes(message_builder)[0] as int)); }
++} else { if mb_hashes(message_builder).len() == 0 { assert(vset(mb_hashes(message_builder)) =~= ISet::<int>::empty()); } }
++}
+@@ -70,0 +111 @@
++assert(M::gen(d, n, p, bloom, true).1 is None);
+@@ -73,0 +115 @@
++assert(M::gen(d, n, p, bloom, true).1 is None);
+@@ -78,2 +120,3 @@
+-sync_state.last_sent_heads.clone_from(&our_heads);
+-sync_state.sent_hashes.extend(message_builder.hashes());
++// CHANGE [C21]: `clone_from(&x)` -> `= x.clone()`.
++sync_state.last_sent_heads = our_heads.clone();
++extend_hashes(&mut sync_state.sent_hashes, message_builder.hashes());
+@@ -85,6 +127,0 @@
+-// When switching from read-only to read-write, we need the remote to
+-// clear its sent_hashes so it resends changes we previously ignored.
+-// Peers that advertise Capability::SyncReset understand the SyncReset
+-// flag. Old peers don't, so we send empty heads to simulate losing all
+-// local state, which triggers the same sent_hashes clearing via the
+-// existing "peer lost all data" code path.
+@@ -97 +134 @@
+-vec![]
++Vec::new()
+@@ -108,0 +146,4 @@
++assert(opt_set_eq(s0.their_heads));
++assert(vset(Seq::<u64>::empty()) =~= ISet::<int>::empty());
++assert(abs_peer(*self, *sync_state) =~= M::gen(d, n, p, bloom, true).0);
++assert(abs_msg(sync_message) =~= M::gen(d, n, p, bloom, true).1->Some_0);
+=== SyncDoc::receive_sync_message
+--- original sync.rs receive_sync_message
++++ verus/conform.rs receive_sync_message
+@@ -1 +1 @@
+-fn receive_sync_message(
++pub fn receive_sync_message(
+@@ -5 +5,4 @@
+-) -> Result<(), AutomergeError> {
++) -> (r: Result<(), AutomergeError>)
++requires a_wf(*old(self)), st_wf(*old(sync_state), *old(self)), msg_wf(message, *old(self)), !old(sync_state).read_only,
++ensures recv_post(*old(self), *old(sync_state), message, *final(self), *final(sync_state), r),
++{
+=== Automerge::receive_sync_message_inner
+--- original sync.rs receive_sync_message_inner
++++ verus/conform.rs receive_sync_message_inner
+@@ -6 +6,9 @@
+-) -> Result<(), AutomergeError> {
++) -> (r: Result<(), AutomergeError>)
++requires a_wf(*old(self)), st_wf(*old(sync_state), *old(self)), msg_wf(message, *old(self)), !old(sync_state).read_only,
++ensures recv_post(*old(self), *old(sync_state), message, *final(self), *final(sync_state), r),
++{
++let ghost a0 = *self;
++let ghost s0 = *sync_state;
++let ghost msg0 = message;
++let ghost d = a_deps(a0);
++let ghost n = a_n(a0);
+@@ -18,2 +25,0 @@
+-// Any peer that sends the flags section supports V2 messages —
+-// the flags section was introduced alongside V2 support.
+@@ -25 +30,0 @@
+-// Process transient per-message signals
+@@ -30,0 +36 @@
++proof { assert(abs_state(*sync_state) == M::Peer { in_flight: false, ..abs_state(s0) }); }
+@@ -33 +39,6 @@
+-self.load_incremental_log_patches(&message_changes.join(), patch_log)?;
++// CHANGE [C26]: `?` -> match.
++match self.load_incremental_log_patches(&message_changes.join(), patch_log) {
++Ok(_) => {}
++Err(e) => return Err(e),
++}
++// CHANGE [C8]: advance_heads takes Vecs.
+@@ -35,2 +46,2 @@
+-&before_heads.iter().collect(),
+-&self.get_heads().into_iter().collect(),
++&before_heads,
++&self.get_heads(),
+@@ -40,4 +51,6 @@
+-// trim down the sent hashes to those that we know they haven't seen
+-self.filter_changes(&message_heads, &mut sync_state.sent_hashes)?;
+-if changes_is_empty && message_heads == before_heads {
+-sync_state.last_sent_heads.clone_from(&message_heads);
++let ghost sent_before = sync_state.sent_hashes;
++let ghost sh_mid = sync_state.shared_heads;
++// CHANGE [C26]: `?` -> match; `&message_heads` -> `message_heads.as_slice()`.
++match self.filter_changes(message_heads.as_slice(), &mut sync_state.sent_hashes) {
++Ok(_) => {}
++Err(e) => return Err(e),
+@@ -45,4 +58,6 @@
+-let known_heads = message_heads
+-.iter()
+-.filter(|head| self.has_change(head))
+-.collect::<Vec<_>>();
++// CHANGE [C25]: `==` on Vec -> vec_eq. CHANGE [C21]: clone_from -> `= x.clone()`.
++if changes_is_empty && vec_eq(&message_heads, &before_heads) {
++sync_state.last_sent_heads = message_heads.clone();
++}
++// CHANGE [C12]: filter/collect replaced by `known_heads` (verified helper).
++let known_heads = self.known_heads(&message_heads);
+@@ -50 +65 @@
+-sync_state.shared_heads.clone_from(&message_heads);
++sync_state.shared_heads = message_heads.clone();
+@@ -53,2 +68,3 @@
+-sync_state.last_sent_heads = Default::default();
+-sync_state.sent_hashes = Default::default();
++// CHANGE [C27]: Default::default() -> Vec::new() / BTreeSet::new()
++sync_state.last_sent_heads = Vec::new();
++sync_state.sent_hashes = BTreeSet::new();
+@@ -57,8 +73,2 @@
+-sync_state.shared_heads = sync_state
+-.shared_heads
+-.iter()
+-.chain(known_heads)
+-.copied()
+-.unique()
+-.sorted()
+-.collect::<Vec<_>>();
++// CHANGE [C9]: itertools chain/unique/sorted -> union_sorted (trusted T13).
++sync_state.shared_heads = union_sorted(&sync_state.shared_heads, &known_heads);
+@@ -68,0 +79,37 @@
++proof {
++let p = abs_peer(a0, s0);
++let m = abs_msg(msg0);
++let s2 = a_doc(*self);
++assert(changes_is_empty == (m.changes == ISet::<int>::empty()));
++assert(vset(before_heads@) == M::heads(d, p.doc));
++// the heads vectors are strictly sorted, so Vec equality is set equality
++if vset(msg0.heads@) == vset(before_heads@) { lemma_sorted_eq(msg0.heads@, before_heads@); }
++assert(vset(Seq::<u64>::empty()) =~= ISet::<int>::empty());
++let q = M::recv(d, n, p, m, s2); let o = abs_peer(*self, *sync_state);
++let known = m.heads.intersect(s2);
++assert(known == vset(known_heads@));
++let all_known = (known_heads@.len() == msg0.heads@.len());
++assert(all_known == (known == m.heads)) by {
++if known == m.heads { assert(m.heads.subset_of(s2)) by { assert forall|x: int| m.heads.contains(x) implies s2.contains(x) by { assert(known.contains(x)); } } }
++if m.heads.subset_of(s2) { assert(known =~= m.heads); }
++}
++assert((msg0.heads@.len() == 0) == (m.heads == ISet::<int>::empty())) by {
++if msg0.heads@.len() > 0 { assert(m.heads.contains(msg0.heads@[0] as int)); }
++if m.heads == ISet::<int>::empty() && msg0.heads@.len() > 0 { assert(false); }
++if msg0.heads@.len() == 0 { assert(m.heads =~= ISet::<int>::empty()); }
++}
++if all_known { assert(o.shared_heads == q.shared_heads); }
++else { assert(o.shared_heads == q.shared_heads); }
++assert(o.doc == q.doc);
++assert(o.queue == q.queue);
++assert(o.their_heads == q.their_heads);
++assert(o.their_have =~= q.their_have);
++assert(o.their_need == q.their_need);
++assert(o.in_flight == q.in_flight);
++assert(o.have_responded == q.have_responded);
++assert(o.needs_reset == q.needs_reset);
++assert(o.sent_hashes == q.sent_hashes);
++assert(o.last_sent_heads == q.last_sent_heads);
++assert(o.shared_heads == q.shared_heads);
++assert(o =~= q);
++}
+=== Automerge::make_bloom_filter
+--- original sync.rs make_bloom_filter
++++ verus/conform.rs make_bloom_filter
+@@ -1 +1,5 @@
+-fn make_bloom_filter(&self, last_sync: Vec<ChangeHash>) -> Have {
++fn make_bloom_filter(&self, last_sync: Vec<ChangeHash>) -> (r: Have)
++requires vset(last_sync@).subset_of(a_doc(*self)),
++ensures r.last_sync@ == last_sync@,
++a_doc(*self).difference(M::closure(a_deps(*self), a_n(*self), vset(last_sync@))).subset_of(bloom_set(r.bloom)),
++{
+@@ -3,0 +8 @@
++bloom: BloomFilter::from_hashes(&hashes),
+@@ -5 +9,0 @@
+-bloom: BloomFilter::from_hashes(hashes.iter()),
+=== Message::reset
+--- original sync.rs reset
++++ verus/conform.rs reset
+@@ -1 +1,4 @@
+-pub(crate) fn reset(our_heads: Vec<ChangeHash>) -> Message {
++pub(crate) fn reset(our_heads: Vec<ChangeHash>) -> (r: Message)
++ensures r.heads@ == our_heads@, r.need@.len() == 0, r.have@.len() == 1, r.have@[0].last_sync@.len() == 0,
++bloom_set(r.have@[0].bloom) == ISet::<int>::empty(), chunk_set(r.changes) == ISet::<int>::empty(),
++{
+=== MessageFlags::new
+--- original sync.rs new
++++ verus/conform.rs new
+@@ -1,3 +1 @@
+-pub fn new() -> Self {
+-Self(0)
+-}
++pub fn new() -> (r: Self) ensures r.0 == 0u8 { Self(0) }
+=== MessageFlags::contains
+--- original sync.rs contains
++++ verus/conform.rs contains
+@@ -1,3 +1 @@
+-pub fn contains(self, flag: u8) -> bool {
+-self.0 & flag != 0
+-}
++pub fn contains(self, flag: u8) -> (r: bool) ensures r == (self.0 & flag != 0) { self.0 & flag != 0 }
+=== MessageFlags::set
+--- original sync.rs set
++++ verus/conform.rs set
+@@ -1,3 +1 @@
+-pub fn set(&mut self, flag: u8) {
+-self.0 |= flag;
+-}
++pub fn set(&mut self, flag: u8) ensures final(self).0 == (old(self).0 | flag) { self.0 |= flag; }
+=== State::on_timeout
+--- original sync/state.rs on_timeout
++++ verus/conform.rs on_timeout
+@@ -1 +1,4 @@
+-pub fn on_timeout(&mut self) {
++pub fn on_timeout(&mut self)
++ensures
++abs_state(*final(self)) == M::tmo(abs_state(*old(self))),
++{
+@@ -3,0 +7 @@
++proof { assert(bset(self.sent_hashes) =~= ISet::<int>::empty()); assert(abs_state(*self) =~= M::tmo(abs_state(*old(self)))); }
+=== State::supports_v2_messages
+--- original sync/state.rs supports_v2_messages
++++ verus/conform.rs supports_v2_messages
+@@ -1,5 +1,5 @@
+-pub(crate) fn supports_v2_messages(&self) -> bool {
+-self.their_capabilities
+-.as_ref()
+-.map(|caps| caps.contains(&Capability::MessageV2))
+-.unwrap_or(false)
++pub fn supports_v2_messages(&self) -> (r: bool) ensures r == st_v2(*self),
++{
++match &self.their_capabilities {
++Some(caps) => has_cap(caps, 1),
++None => false,
+@@ -6,0 +7 @@
++}
+=== State::peer_supports_sync_reset
+--- original sync/state.rs peer_supports_sync_reset
++++ verus/conform.rs peer_supports_sync_reset
+@@ -1,5 +1,5 @@
+-pub(crate) fn peer_supports_sync_reset(&self) -> bool {
+-self.their_capabilities
+-.as_ref()
+-.map(|caps| caps.contains(&Capability::SyncReset))
+-.unwrap_or(false)
++pub(crate) fn peer_supports_sync_reset(&self) -> (r: bool) ensures r == st_sr(*self),
++{
++match &self.their_capabilities {
++Some(caps) => has_cap(caps, 2),
++None => false,
+@@ -6,0 +7 @@
++}
+=== State::is_peer_read_only
+--- original sync/state.rs is_peer_read_only
++++ verus/conform.rs is_peer_read_only
+@@ -1 +1,2 @@
+-pub fn is_peer_read_only(&self) -> bool {
++pub fn is_peer_read_only(&self) -> (r: bool) ensures r == self.peer_read_only,
++{
+=== State::send_doc
+--- original sync/state.rs send_doc
++++ verus/conform.rs send_doc
+@@ -1,2 +1,4 @@
+-pub(crate) fn send_doc(&self) -> bool {
+-self.their_heads == Some(vec![]) && self.supports_v2_messages()
++pub(crate) fn send_doc(&self) -> (r: bool) ensures r ==> st_v2(*self),
++{
++let empty = match &self.their_heads { Some(h) => h.len() == 0, None => false };
++empty && self.supports_v2_messages()
+=== State::their
+--- original sync/state.rs their
++++ verus/conform.rs their
+@@ -1,3 +1,6 @@
+-pub(crate) fn their(&self) -> Option<(&[Have], &[ChangeHash])> {
+-let have = self.their_have.as_ref()?;
+-let need = self.their_need.as_ref()?;
++pub(crate) fn their(&self) -> (r: Option<(&[Have], &[ChangeHash])>)
++ensures (self.their_have is Some && self.their_need is Some) == (r is Some),
++r is Some ==> (r->Some_0.0@ == self.their_have->Some_0@ && r->Some_0.1@ == self.their_need->Some_0@),
++{
++let have = match self.their_have.as_ref() { Some(h) => h, None => return None };
++let need = match self.their_need.as_ref() { Some(n) => n, None => return None };
