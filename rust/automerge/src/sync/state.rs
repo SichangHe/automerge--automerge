@@ -181,6 +181,19 @@ impl State {
         }
     }
 
+    /// Tell the state that a reply from the peer is overdue, so a message may have been lost.
+    ///
+    /// This forgets which changes we believe we already sent ([`Self::sent_hashes`]) and
+    /// that a message is in flight ([`Self::in_flight`]). The next call to
+    /// [`SyncDoc::generate_sync_message()`] then sends again whatever the peer still appears to
+    /// lack, instead of staying silent. It keeps everything else we know about the peer, so it
+    /// is cheaper than creating a new [`State`]. Calling it too often only wastes bandwidth:
+    /// changes may be sent more than once.
+    pub fn on_timeout(&mut self) {
+        self.sent_hashes.clear();
+        self.in_flight = false;
+    }
+
     /// Returns true if the remote peer has advertised that it is in read-only
     /// mode. A read-only peer will not apply incoming changes, so there is no
     /// point sending them.

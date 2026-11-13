@@ -4,6 +4,15 @@
 //! <https://arxiv.org/abs/2012.00472>, it assumes a reliable in-order stream
 //! between two peers who are synchronizing a document.
 //!
+//! If a message might have been lost (for example a datagram transport, or a
+//! connection that dropped), the application must call [`State::on_timeout()`]
+//! when it has waited too long for a reply and then call
+//! [`SyncDoc::generate_sync_message()`] again. Without this, a lost message can
+//! leave both peers waiting for each other, or can leave one peer waiting for
+//! changes that the other believes it already sent (see automerge issues #772
+//! and #1284). Resetting the whole [`State`] also works but throws away what we
+//! know about the peer.
+//!
 //! Each peer maintains a [`State`] for each peer they are synchronizing with.
 //! This state tracks things like what the heads of the other peer are and
 //! whether there are in-flight messages. Anything which implements [`SyncDoc`]
