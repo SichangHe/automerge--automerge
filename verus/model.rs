@@ -75,14 +75,23 @@ pub open spec fn report_in_sync(d: Deps, n: int, p: Peer) -> bool {
     !must_reset(p) && p.last_sent_heads == oh && p.have_responded && p.their_heads == Some(oh)
         && send_set(d, n, p) == ISet::<int>::empty()
 }
-pub open spec fn gen(d: Deps, n: int, p: Peer, bloom: ISet<int>, fake: bool) -> (Peer, Option<Msg>) {
+// [M1 closed] Message::reset: no changes, no need, ONE empty Have (empty last_sync, empty bloom), as in the code.
+// Opaque so that the round proofs (which never reach this branch) are not slowed down.
+#[verifier::opaque]
+pub open spec fn reset_msg(oh: ISet<int>) -> Msg {
+    Msg { heads: oh, need: ISet::empty(), have: seq![Have { last_sync: ISet::empty(), bloom: ISet::empty() }], changes: ISet::empty() }
+}
+pub proof fn lemma_reset_msg(oh: ISet<int>)
+    ensures reset_msg(oh) == (Msg { heads: oh, need: ISet::empty(), have: seq![Have { last_sync: ISet::empty(), bloom: ISet::empty() }], changes: ISet::empty() }),
+{ reveal(reset_msg); }
+// [M2 closed] `send` = the changes put in the message: send_set (Gen), or the whole document (GenDoc).
+pub open spec fn gen_s(d: Deps, n: int, p: Peer, bloom: ISet<int>, fake: bool, send: ISet<int>) -> (Peer, Option<Msg>) {
     let oh = heads(d, p.doc);
     let need = missing(d, n, p.doc, p.queue, opt_set(p.their_heads));
     let have = if need.subset_of(opt_set(p.their_heads)) { seq![Have { last_sync: p.shared_heads, bloom: bloom }] } else { Seq::empty() };
     if must_reset(p) {
-        (p, Some(Msg { heads: oh, need: ISet::empty(), have: Seq::empty(), changes: ISet::empty() }))
+        (p, Some(reset_msg(oh)))
     } else {
-        let send = send_set(d, n, p);
         if p.last_sent_heads == oh && p.have_responded
             && ((p.their_heads == Some(oh) && send == ISet::<int>::empty()) || p.in_flight) {
             (p, None)
@@ -93,6 +102,9 @@ pub open spec fn gen(d: Deps, n: int, p: Peer, bloom: ISet<int>, fake: bool) -> 
             (p2, Some(Msg { heads: hts, need: need, have: have, changes: send }))
         }
     }
+}
+pub open spec fn gen(d: Deps, n: int, p: Peer, bloom: ISet<int>, fake: bool) -> (Peer, Option<Msg>) {
+    gen_s(d, n, p, bloom, fake, send_set(d, n, p))
 }
 // drain of the change queue: maximal dependency-closed extension using pool
 pub open spec fn drain_ok(d: Deps, s: ISet<int>, pool: ISet<int>, s2: ISet<int>) -> bool {
@@ -120,6 +132,8 @@ pub open spec fn recv(d: Deps, n: int, p: Peer, m: Msg, s2: ISet<int>) -> Peer {
 pub enum Step {
     Edit { who: int, c: int },
     Gen { who: int, bloom: ISet<int>, fake: bool },
+    // [M2] generate_sync_message sends the whole document (send_doc / more than a third of the changes)
+    GenDoc { who: int, bloom: ISet<int>, fake: bool },
     Recv { who: int, m: Msg, s2: ISet<int>, keep: bool },
     Drop { who: int, m: Msg },
     SetReset { who: int },
@@ -133,7 +147,7 @@ pub open spec fn guard(d: Deps, n: int, w: World, st: Step) -> bool {
             && d(c).subset_of(p.doc)
             && (forall|y: int| #[trigger] p.queue.contains(y) ==> !d(y).contains(c))
         }
-        Step::Gen { who, bloom, fake } => {
+        Step::Gen { who, bloom, fake } | Step::GenDoc { who, bloom, fake } => {
             let p = w.peers[who];
             (who == 0 || who == 1)
             && p.doc.difference(closure(d, n, p.shared_heads)).subset_of(bloom)
@@ -160,6 +174,12 @@ pub open spec fn apply(d: Deps, n: int, w: World, st: Step) -> World {
         Step::Gen { who, bloom, fake } => {
             let p = w.peers[who];
             let r = gen(d, n, p, bloom, fake);
+            World { peers: w.peers.update(who, r.0),
+                    net: match r.1 { Some(m) => w.net.update(who, w.net[who].insert(m)), None => w.net } }
+        }
+        Step::GenDoc { who, bloom, fake } => {
+            let p = w.peers[who];
+            let r = gen_s(d, n, p, bloom, fake, p.doc);
             World { peers: w.peers.update(who, r.0),
                     net: match r.1 { Some(m) => w.net.update(who, w.net[who].insert(m)), None => w.net } }
         }
@@ -245,7 +265,7 @@ pub proof fn lemma_init(d: Deps, n: int, w: World)
 }
 
 // gen keeps docs and only emits messages whose heads are the heads of a closed sub-doc
-proof fn lemma_step(d: Deps, n: int, w: World, st: Step, w2: World)
+pub proof fn lemma_step(d: Deps, n: int, w: World, st: Step, w2: World)
     requires wf(d, n), inv(d, n, w), next(d, n, w, st, w2), ensures inv(d, n, w2),
 {
     let e = ISet::<int>::empty();
@@ -276,6 +296,40 @@ proof fn lemma_step(d: Deps, n: int, w: World, st: Step, w2: World)
                 if i == who {
                     if let Some(m) = r.1 {
                         assert(w2.net[i] == w.net[i].insert(m));
+                        if must_reset(p) { lemma_reset_msg(heads(d, p.doc)); }
+                        assert(m.heads == heads(d, p.doc) || m.heads == e || m.heads == heads(d, p.doc));
+                        assert(heads(d, e) == e) by { assert(heads(d, e) =~= e); }
+                    }
+                    assert forall|m2: Msg| #[trigger] w2.net[i].contains(m2) implies exists|t: ISet<int>|
+                        closed(d, t) && bounded(t, n) && t.subset_of(p.doc) && heads(d, t) == m2.heads by {
+                        if w.net[i].contains(m2) { } else {
+                            assert(Some(m2) == r.1);
+                            if m2.heads == heads(d, p.doc) {
+                                assert(p.doc.subset_of(p.doc));
+                            } else {
+                                assert(m2.heads == e);
+                                assert(heads(d, e) == e) by { assert(heads(d, e) =~= e); }
+                                assert(e.subset_of(p.doc));
+                            }
+                        }
+                    }
+                } else {
+                    assert(w2.net[i] == w.net[i]);
+                }
+            }
+        }
+        Step::GenDoc { who, bloom, fake } => {
+            let p = w.peers[who];
+            let r = gen_s(d, n, p, bloom, fake, p.doc);
+            assert(r.0.doc == p.doc);
+            assert(w2.peers.len() == 2);
+            assert forall|i: int| 0 <= i < 2 implies peer_inv(d, n, w2, i) by {
+                assert(w2.peers[i] == if i == who { r.0 } else { w.peers[i] });
+                assert(w2.peers[1 - i] == if 1 - i == who { r.0 } else { w.peers[1 - i] });
+                if i == who {
+                    if let Some(m) = r.1 {
+                        assert(w2.net[i] == w.net[i].insert(m));
+                        if must_reset(p) { lemma_reset_msg(heads(d, p.doc)); }
                         assert(m.heads == heads(d, p.doc) || m.heads == e || m.heads == heads(d, p.doc));
                         assert(heads(d, e) == e) by { assert(heads(d, e) =~= e); }
                     }
@@ -380,12 +434,12 @@ pub proof fn theorem_inv_reachable(d: Deps, n: int, w: World, k: nat)
 }
 
 // SAFETY: if both peers would answer None through the heads_equal branch, their change sets are identical.
-pub proof fn theorem_safety(d: Deps, n: int, w: World, k: nat)
-    requires wf(d, n), reachable(d, n, w, k),
+// (from any world satisfying inv, e.g. any reachable world, or the start of a real session)
+pub proof fn theorem_safety_inv(d: Deps, n: int, w: World)
+    requires wf(d, n), inv(d, n, w),
         report_in_sync(d, n, w.peers[0]), report_in_sync(d, n, w.peers[1]),
     ensures w.peers[0].doc == w.peers[1].doc,
 {
-    theorem_inv_reachable(d, n, w, k);
     let a = w.peers[0]; let b = w.peers[1];
     let ta = choose|t: ISet<int>| closed(d, t) && bounded(t, n) && t.subset_of(b.doc) && heads(d, t) == heads(d, a.doc);
     let tb = choose|t: ISet<int>| closed(d, t) && bounded(t, n) && t.subset_of(a.doc) && heads(d, t) == heads(d, b.doc);
@@ -393,8 +447,14 @@ pub proof fn theorem_safety(d: Deps, n: int, w: World, k: nat)
     lemma_heads_determine(d, n, b.doc, tb);
     assert(a.doc =~= b.doc);
 }
-
-
+pub proof fn theorem_safety(d: Deps, n: int, w: World, k: nat)
+    requires wf(d, n), reachable(d, n, w, k),
+        report_in_sync(d, n, w.peers[0]), report_in_sync(d, n, w.peers[1]),
+    ensures w.peers[0].doc == w.peers[1].doc,
+{
+    theorem_inv_reachable(d, n, w, k);
+    theorem_safety_inv(d, n, w);
+}
 
 // =====================================================================================
 // Part 2: extra invariant (needed by liveness).  xinv holds in every reachable world.
@@ -440,9 +500,40 @@ proof fn lemma_gen_props(d: Deps, n: int, p: Peer, bloom: ISet<int>, fake: bool)
     let r = gen(d, n, p, bloom, fake);
     if r.1 is Some {
         let m = r.1.unwrap();
+        if must_reset(p) { lemma_reset_msg(heads(d, p.doc)); }
         assert(m.changes.subset_of(p.doc));
         assert forall|k: int| 0 <= k < m.have.len() implies #[trigger] m.have[k].last_sync.subset_of(p.shared_heads) by {
-            assert(m.have[k].last_sync == p.shared_heads);
+            if must_reset(p) {
+                lemma_reset_msg(heads(d, p.doc));
+                assert(m.have[k].last_sync == ISet::<int>::empty());
+                assert(ISet::<int>::empty().subset_of(p.shared_heads));
+            } else { assert(m.have[k].last_sync == p.shared_heads); }
+        }
+    }
+}
+proof fn lemma_gens_props(d: Deps, n: int, p: Peer, bloom: ISet<int>, fake: bool, send: ISet<int>)
+    requires send.subset_of(p.doc),
+    ensures
+        gen_s(d, n, p, bloom, fake, send).0.doc == p.doc, gen_s(d, n, p, bloom, fake, send).0.queue == p.queue,
+        gen_s(d, n, p, bloom, fake, send).0.shared_heads == p.shared_heads,
+        gen_s(d, n, p, bloom, fake, send).0.their_have == p.their_have,
+        gen_s(d, n, p, bloom, fake, send).1 is Some ==> ({
+            let m = gen_s(d, n, p, bloom, fake, send).1.unwrap();
+            m.changes.subset_of(p.doc)
+            && (forall|k: int| 0 <= k < m.have.len() ==> #[trigger] m.have[k].last_sync.subset_of(p.shared_heads))
+        }),
+{
+    let r = gen_s(d, n, p, bloom, fake, send);
+    if r.1 is Some {
+        let m = r.1.unwrap();
+        if must_reset(p) { lemma_reset_msg(heads(d, p.doc)); }
+        assert(m.changes.subset_of(p.doc));
+        assert forall|k: int| 0 <= k < m.have.len() implies #[trigger] m.have[k].last_sync.subset_of(p.shared_heads) by {
+            if must_reset(p) {
+                lemma_reset_msg(heads(d, p.doc));
+                assert(m.have[k].last_sync == ISet::<int>::empty());
+                assert(ISet::<int>::empty().subset_of(p.shared_heads));
+            } else { assert(m.have[k].last_sync == p.shared_heads); }
         }
     }
 }
@@ -526,6 +617,36 @@ pub proof fn lemma_xstep(d: Deps, n: int, w: World, st: Step, w2: World)
             let p = w.peers[who];
             let r = gen(d, n, p, bloom, fake);
             lemma_gen_props(d, n, p, bloom, fake);
+            assert forall|i: int| 0 <= i < 2 implies xinv_p(d, n, w2, i) by {
+                assert(w2.peers[i] == if i == who { r.0 } else { w.peers[i] });
+                assert(w2.peers[1 - i] == if 1 - i == who { r.0 } else { w.peers[1 - i] });
+                assert forall|m: Msg| #[trigger] w2.net[i].contains(m) implies
+                    m.changes.subset_of(w2.peers[i].doc) && bounded(m.changes, n)
+                    && (forall|k: int| 0 <= k < m.have.len() ==> #[trigger] m.have[k].last_sync.subset_of(w2.peers[1 - i].doc)) by {
+                    if i == who {
+                        match r.1 {
+                            Some(m0) => {
+                                assert(w2.net[i] == w.net[i].insert(m0));
+                                if m0 == m {
+                                    assert(m.changes.subset_of(p.doc));
+                                    assert forall|x: int| m.changes.contains(x) implies 0 <= x && x < n by {
+                                        assert(p.doc.contains(x));
+                                    }
+                                    assert forall|k: int| 0 <= k < m.have.len() implies #[trigger] m.have[k].last_sync.subset_of(w2.peers[1 - i].doc) by {
+                                        assert(m.have[k].last_sync.subset_of(p.shared_heads));
+                                    }
+                                } else { assert(w.net[i].contains(m)); }
+                            }
+                            None => { assert(w2.net[i] == w.net[i]); }
+                        }
+                    } else { assert(w2.net[i] == w.net[i]); assert(w.net[i].contains(m)); }
+                }
+            }
+        }
+        Step::GenDoc { who, bloom, fake } => {
+            let p = w.peers[who];
+            let r = gen_s(d, n, p, bloom, fake, p.doc);
+            lemma_gens_props(d, n, p, bloom, fake, p.doc);
             assert forall|i: int| 0 <= i < 2 implies xinv_p(d, n, w2, i) by {
                 assert(w2.peers[i] == if i == who { r.0 } else { w.peers[i] });
                 assert(w2.peers[1 - i] == if 1 - i == who { r.0 } else { w.peers[1 - i] });

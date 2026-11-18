@@ -109,6 +109,7 @@ pub open spec fn sorted_strict(v: Seq<u64>) -> bool { forall|i: int, j: int| 0 <
 impl ChangeGraph {
     // TRUSTED [T4]: get_hashes(h) = all applied changes that are not ancestors-or-self of h.
     // (h must be applied changes: the real code's behaviour on unknown hashes is not examined.)
+    // get_hashes(&[]) returns every applied change (`Cow::Borrowed(&self.hashes)`); it is the model's closure(empty) = empty case.
     // CHANGE [C3]: returns Vec instead of Cow<[ChangeHash]>.
     #[verifier::external_body]
     pub fn get_hashes(&self, have_deps: &Vec<ChangeHash>) -> (r: Vec<ChangeHash>)
@@ -178,9 +179,13 @@ impl MessageBuilder {
         ensures vset(mb_hashes(r)) == chgs_set(changes@), mb_cset(r) == chgs_set(changes@),
             mb_heads(r).len() == 0, mb_need(r).len() == 0, mb_have(r).len() == 0, mb_flags(r) is None,
     { unimplemented!() }
-    // unreachable under the fragment's precondition (supports_v2_messages is false); spec is deliberately weak.
+    // TRUSTED [T14]: the V2 builder records the given hashes and encodes the changes in `data` (the saved document);
+    // no heads, need, have, flags. (Real code: empty `data` gives `new_empty_v2`, with no hashes either way.)
     #[verifier::external_body]
-    pub fn new_v2(data: Vec<u8>, hashes: Vec<ChangeHash>) -> (r: MessageBuilder) { unimplemented!() }
+    pub fn new_v2(data: Vec<u8>, hashes: Vec<ChangeHash>) -> (r: MessageBuilder)
+        ensures vset(mb_hashes(r)) == vset(hashes@), mb_cset(r) == bytes_set(data@),
+            mb_heads(r).len() == 0, mb_need(r).len() == 0, mb_have(r).len() == 0, mb_flags(r) is None,
+    { unimplemented!() }
     #[verifier::external_body]
     pub fn is_empty(&self) -> (r: bool) ensures r == (mb_hashes(*self).len() == 0), { unimplemented!() }
     // CHANGE [C6]: returns &Vec<ChangeHash> instead of an iterator.
@@ -244,9 +249,9 @@ impl Automerge {
         requires vset(hashes@).subset_of(a_doc(*self)),
         ensures r is Ok, r is Ok ==> chgs_set(r->Ok_0@) == vset(hashes@),
     { unimplemented!() }
-    // unreachable under the precondition
+    // TRUSTED [T14]: the saved document encodes exactly the applied changes.
     #[verifier::external_body]
-    pub fn save(&self) -> (r: Vec<u8>) { unimplemented!() }
+    pub fn save(&self) -> (r: Vec<u8>) ensures bytes_set(r@) == a_doc(*self), { unimplemented!() }
     // TRUSTED [T10]: apply the changes encoded in `data`: the new doc is a maximal dependency-closed extension of the
     // old doc using the queue plus the new changes (= model drain_ok); the new queue is the rest.
     // On Err nothing is said about the document.
@@ -532,6 +537,8 @@ impl State {
     pub fn on_timeout(&mut self)
         ensures
             abs_state(*final(self)) == M::tmo(abs_state(*old(self))),
+            final(self).read_only == old(self).read_only, final(self).peer_read_only == old(self).peer_read_only,
+            forall|a: Automerge| st_wf(*final(self), a) == st_wf(*old(self), a),
     {
         self.sent_hashes.clear();
         self.in_flight = false;
@@ -620,20 +627,17 @@ pub open spec fn msg_wf(m: Message, a: Automerge) -> bool {
     sorted_strict(m.heads@) && m.have@.len() <= 1 && M::bounded(chunk_set(m.changes), a_n(a))
     && (match m.flags { Some(f) => f.0 & 1 == 0 && f.0 & 2 == 0, None => true })
 }
-// Fragment of generate_sync_message that the model describes: no read-only, peer not v2-capable.
-pub open spec fn gen_frag(s: State) -> bool { !s.read_only && !s.peer_read_only && !st_v2(s) && !st_sr(s) }
+// Fragment of generate_sync_message that the model describes: no read-only mode (either side). Peer capabilities
+// (MessageV2, SyncReset) are unrestricted: whole-document sends are the model's GenDoc step.
+// the model's `fake` flag: the peer is not known to support SYNC_RESET
+pub open spec fn fake_of(s: State) -> bool { !st_sr(s) }
+pub open spec fn gen_frag(s: State) -> bool { !s.read_only && !s.peer_read_only }
 
 pub open spec fn opt_set_eq(o: Option<Vec<ChangeHash>>) -> bool { M::opt_set(abs_vec_opt(o)) == abs_opt_set(o) }
 pub open spec fn gen_msg_ok(p: M::Peer, r: Option<Message>, om: Option<M::Msg>) -> bool {
     match (r, om) {
         (None, None) => true,
-        (Some(m), Some(mm)) => {
-            if M::must_reset(p) {
-                // MISMATCH [M1]: the real reset message carries one empty `Have`, the model's carries none.
-                vset(m.heads@) == mm.heads && vset(m.need@) == mm.need && chunk_set(m.changes) == mm.changes
-                && abs_haves(m.have@) == seq![M::Have { last_sync: ISet::empty(), bloom: ISet::empty() }]
-            } else { abs_msg(m) == mm }
-        }
+        (Some(m), Some(mm)) => abs_msg(m) == mm,   // [M1 closed] the model's reset message has the code's one empty Have
         _ => false,
     }
 }
@@ -683,6 +687,15 @@ pub proof fn lemma_sorted_eq(a: Seq<u64>, b: Seq<u64>)
         assert(a =~= b);
     }
 }
+pub proof fn lemma_reach_empty(d: M::Deps, k: nat)
+    ensures M::reach(d, ISet::<int>::empty(), k) == ISet::<int>::empty(),
+    decreases k,
+{
+    if k == 0 { } else {
+        lemma_reach_empty(d, (k - 1) as nat);
+        assert(M::reach(d, ISet::<int>::empty(), k) =~= ISet::<int>::empty());
+    }
+}
 pub proof fn lemma_hts_subset(d: M::Deps, n: int, s: ISet<int>, have: Seq<M::Have>, need: ISet<int>)
     ensures M::hashes_to_send(d, n, s, have, need).subset_of(s),
 {
@@ -703,8 +716,21 @@ pub open spec fn recv_post(a0: Automerge, s0: State, msg: Message, a1: Automerge
             && M::drain_ok(d, p.doc, p.queue.union(m.changes), s2)
             && (m.changes == ISet::<int>::empty() ==> s2 == p.doc)
             && abs_peer(a1, s1) == M::recv(d, n, p, m, s2)
+            && s1.read_only == s0.read_only && (!s0.peer_read_only ==> !s1.peer_read_only)
         }
         Err(_) => abs_state(s1) == M::Peer { in_flight: false, ..abs_state(s0) },
+    }
+}
+
+// The contract of generate_sync_message: the step is the model's Gen (send = send_set) or GenDoc (send = whole
+// document); `fake` = peer not known to support SYNC_RESET.
+pub open spec fn gen_post(a: Automerge, s0: State, s1: State, r: Option<Message>) -> bool {
+    st_wf(s1, a) && s1.read_only == s0.read_only && s1.peer_read_only == s0.peer_read_only
+    && exists|bloom: ISet<int>, send: ISet<int>| {
+        &&& a_doc(a).difference(M::closure(a_deps(a), a_n(a), vset(s0.shared_heads@))).subset_of(bloom)
+        &&& (send == M::send_set(a_deps(a), a_n(a), abs_peer(a, s0)) || send == a_doc(a))
+        &&& abs_peer(a, s1) == (#[trigger] M::gen_s(a_deps(a), a_n(a), abs_peer(a, s0), bloom, fake_of(s0), send)).0
+        &&& gen_msg_ok(abs_peer(a, s0), r, M::gen_s(a_deps(a), a_n(a), abs_peer(a, s0), bloom, fake_of(s0), send).1)
     }
 }
 
@@ -727,18 +753,13 @@ impl Automerge {
 
     pub fn generate_sync_message(&self, sync_state: &mut State) -> (r: Option<Message>)
         requires a_wf(*self), st_wf(*old(sync_state), *self), gen_frag(*old(sync_state)),
-        ensures
-            st_wf(*final(sync_state), *self),
-            exists|bloom: ISet<int>| {
-                &&& a_doc(*self).difference(M::closure(a_deps(*self), a_n(*self), vset(old(sync_state).shared_heads@))).subset_of(bloom)
-                &&& abs_peer(*self, *final(sync_state)) == M::gen(a_deps(*self), a_n(*self), abs_peer(*self, *old(sync_state)), bloom, true).0
-                &&& gen_msg_ok(abs_peer(*self, *old(sync_state)), r, M::gen(a_deps(*self), a_n(*self), abs_peer(*self, *old(sync_state)), bloom, true).1)
-            },
+        ensures gen_post(*self, *old(sync_state), *final(sync_state), r),
     {
         let ghost s0 = *sync_state;
         let ghost d = a_deps(*self);
         let ghost n = a_n(*self);
         let ghost p = abs_peer(*self, s0);
+        let ghost fake = fake_of(s0);
         let our_heads = self.get_heads();
 
         // CHANGE [C19]: `vec![]` needs a type; `missing_deps_from(sync_state.their_heads.iter().flatten().copied())`
@@ -776,8 +797,11 @@ impl Automerge {
                     assert(abs_haves(rm.have@) =~= seq![M::Have { last_sync: ISet::empty(), bloom: ISet::empty() }]);
                     assert(vset(rm.heads@) == oh);
                     let r = Some(rm);
-                    assert(abs_peer(*self, *sync_state) == M::gen(d, n, p, bloom, true).0);
-                    assert(gen_msg_ok(p, r, M::gen(d, n, p, bloom, true).1));
+                    let ghost send0 = M::send_set(d, n, p);
+                    proof { M::lemma_reset_msg(oh); }
+                    assert(abs_peer(*self, *sync_state) == M::gen_s(d, n, p, bloom, fake, send0).0);
+                    assert(abs_msg(rm) =~= M::reset_msg(oh));
+                    assert(gen_msg_ok(p, r, M::gen_s(d, n, p, bloom, fake, send0).1));
                     assert(st_wf(*sync_state, *self));
                     return r;
                 }
@@ -792,6 +816,7 @@ impl Automerge {
         } else if let Some((their_have, their_need)) = sync_state.their() {
             if sync_state.send_doc() {
                 let hashes = self.change_graph.get_hashes(&Vec::new());
+                proof { lemma_reach_empty(d, n as nat); assert(vset(Seq::<u64>::empty()) =~= ISet::<int>::empty()); assert(vset(hashes@) =~= a_doc(*self)); }
                 MessageBuilder::new_v2(self.save(), hashes)
             } else {
                 let all_hashes = self
@@ -802,6 +827,7 @@ impl Automerge {
                 let hashes: Vec<_> = filter_unsent(all_hashes, &sync_state.sent_hashes);
                 if hashes.len() > self.change_graph.len() / 3 && sync_state.supports_v2_messages() {
                     let all_hashes = self.change_graph.get_hashes(&Vec::new());
+                    proof { lemma_reach_empty(d, n as nat); assert(vset(Seq::<u64>::empty()) =~= ISet::<int>::empty()); assert(vset(all_hashes@) =~= a_doc(*self)); }
                     MessageBuilder::new_v2(self.save(), all_hashes)
                 } else {
                     // CHANGE [C20]: `.ok()?` -> match (the Err arm is excluded by T9).
@@ -812,10 +838,10 @@ impl Automerge {
         } else {
             MessageBuilder::new(Vec::new(), sync_state)
         };
-        let ghost send = M::send_set(d, n, p);
-        assert(mb_cset(message_builder) == send && vset(mb_hashes(message_builder)) == send) by {
-            assert(abs_haves(s0.their_have->Some_0@) =~= abs_haves(s0.their_have->Some_0@));
-        }
+        // Path by path: the builder holds send_set (ordinary branch) or the whole document (send_doc / one-third rule).
+        let ghost send = mb_cset(message_builder);
+        proof { lemma_reach_empty(d, n as nat); }
+        assert((send == M::send_set(d, n, p) || send == a_doc(*self)) && vset(mb_hashes(message_builder)) == send);
 
         let heads_unchanged = vec_eq(&sync_state.last_sent_heads, &our_heads);
         proof {
@@ -842,11 +868,11 @@ impl Automerge {
 
         if heads_unchanged && sync_state.have_responded {
             if (heads_equal || sync_state.read_only) && message_builder.is_empty() {
-                assert(M::gen(d, n, p, bloom, true).1 is None);
+                assert(M::gen_s(d, n, p, bloom, fake, send).1 is None);
                 return None;
             }
             if sync_state.in_flight {
-                assert(M::gen(d, n, p, bloom, true).1 is None);
+                assert(M::gen_s(d, n, p, bloom, fake, send).1 is None);
                 return None;
             }
         }
@@ -884,8 +910,8 @@ impl Automerge {
         sync_state.in_flight = true;
         assert(opt_set_eq(s0.their_heads));
         assert(vset(Seq::<u64>::empty()) =~= ISet::<int>::empty());
-        assert(abs_peer(*self, *sync_state) =~= M::gen(d, n, p, bloom, true).0);
-        assert(abs_msg(sync_message) =~= M::gen(d, n, p, bloom, true).1->Some_0);
+        assert(abs_peer(*self, *sync_state) =~= M::gen_s(d, n, p, bloom, fake, send).0);
+        assert(abs_msg(sync_message) =~= M::gen_s(d, n, p, bloom, fake, send).1->Some_0);
         Some(sync_message)
     }
 
@@ -1034,6 +1060,193 @@ impl Automerge {
         }
         Ok(())
     }
+}
+
+
+// =====================================================================================
+// Part D: composition. A run of the real code (two Automerge documents, two sync States, a ghost network of
+// abstract messages) is a run of the model, so the model's theorems apply to it.
+// What is assumed (not proved): `step_edit` (a local edit conforms to the model's Edit step: no code for it here),
+// that every delivered message satisfies msg_wf, that receive returns Ok, and that read-only mode is off.
+// =====================================================================================
+pub struct Cfg { pub a: Seq<Automerge>, pub s: Seq<State>, pub net: Seq<ISet<M::Msg>> }
+
+pub open spec fn abs_cfg(c: Cfg) -> M::World {
+    M::World { peers: Seq::new(2, |i: int| abs_peer(c.a[i], c.s[i])), net: c.net }
+}
+pub open spec fn cfg_peer_ok(c: Cfg, i: int) -> bool {
+    a_wf(c.a[i]) && st_wf(c.s[i], c.a[i]) && !c.s[i].read_only && !c.s[i].peer_read_only
+    && a_deps(c.a[i]) == a_deps(c.a[0]) && a_n(c.a[i]) == a_n(c.a[0])
+}
+pub open spec fn cfg_wf(c: Cfg) -> bool {
+    c.a.len() == 2 && c.s.len() == 2 && c.net.len() == 2 && cfg_peer_ok(c, 0) && cfg_peer_ok(c, 1)
+}
+pub open spec fn cfg_d(c: Cfg) -> M::Deps { a_deps(c.a[0]) }
+pub open spec fn cfg_n(c: Cfg) -> int { a_n(c.a[0]) }
+
+pub open spec fn gen_rel(c: Cfg, c2: Cfg, who: int, s1: State, r: Option<Message>) -> bool {
+    gen_post(c.a[who], c.s[who], s1, r)
+    && c2.a == c.a && c2.s == c.s.update(who, s1)
+    && c2.net == (match r { Some(m) => c.net.update(who, c.net[who].insert(abs_msg(m))), None => c.net })
+}
+pub open spec fn step_gen(c: Cfg, c2: Cfg, who: int) -> bool { exists|s1: State, r: Option<Message>| gen_rel(c, c2, who, s1, r) }
+pub open spec fn recv_rel(c: Cfg, c2: Cfg, who: int, keep: bool, msg: Message, a1: Automerge, s1: State) -> bool {
+    msg_wf(msg, c.a[who]) && c.net[1 - who].contains(abs_msg(msg))
+    && recv_post(c.a[who], c.s[who], msg, a1, s1, Result::<(), AutomergeError>::Ok(()))
+    && c2.a == c.a.update(who, a1) && c2.s == c.s.update(who, s1)
+    && c2.net == (if keep { c.net } else { c.net.update(1 - who, c.net[1 - who].remove(abs_msg(msg))) })
+}
+pub open spec fn step_recv(c: Cfg, c2: Cfg, who: int, keep: bool) -> bool {
+    exists|msg: Message, a1: Automerge, s1: State| recv_rel(c, c2, who, keep, msg, a1, s1)
+}
+pub open spec fn tmo_rel(c: Cfg, c2: Cfg, who: int, s1: State) -> bool {
+    abs_state(s1) == M::tmo(abs_state(c.s[who]))
+    && s1.read_only == c.s[who].read_only && s1.peer_read_only == c.s[who].peer_read_only
+    && (forall|a: Automerge| st_wf(s1, a) == st_wf(c.s[who], a))
+    && c2.a == c.a && c2.s == c.s.update(who, s1) && c2.net == c.net
+}
+pub open spec fn step_tmo(c: Cfg, c2: Cfg, who: int) -> bool { exists|s1: State| tmo_rel(c, c2, who, s1) }
+pub open spec fn drop_rel(c: Cfg, c2: Cfg, who: int, m: M::Msg) -> bool {
+    c.net[who].contains(m) && c2.a == c.a && c2.s == c.s && c2.net == c.net.update(who, c.net[who].remove(m))
+}
+pub open spec fn step_drop(c: Cfg, c2: Cfg, who: int) -> bool { exists|m: M::Msg| drop_rel(c, c2, who, m) }
+// TRUSTED: a local edit adds one change `ch` to the document, as the model's Edit step does (no code is verified here).
+pub open spec fn edit_rel(c: Cfg, c2: Cfg, who: int, a1: Automerge, ch: int) -> bool {
+    M::guard(cfg_d(c), cfg_n(c), abs_cfg(c), M::Step::Edit { who, c: ch })
+    && a_wf(a1) && a_deps(a1) == a_deps(c.a[who]) && a_n(a1) == a_n(c.a[who])
+    && a_doc(a1) == a_doc(c.a[who]).insert(ch) && a_queue(a1) == a_queue(c.a[who])
+    && c2.a == c.a.update(who, a1) && c2.s == c.s && c2.net == c.net
+}
+pub open spec fn step_edit(c: Cfg, c2: Cfg, who: int) -> bool { exists|a1: Automerge, ch: int| edit_rel(c, c2, who, a1, ch) }
+pub open spec fn step_any(c: Cfg, c2: Cfg, who: int, keep: bool) -> bool {
+    (who == 0 || who == 1) && (step_gen(c, c2, who) || step_recv(c, c2, who, keep) || step_tmo(c, c2, who)
+        || step_drop(c, c2, who) || step_edit(c, c2, who))
+}
+pub open spec fn code_next(c: Cfg, c2: Cfg) -> bool { exists|who: int, keep: bool| step_any(c, c2, who, keep) }
+
+// A code step is a model step (and keeps the code configuration well-formed).
+pub proof fn lemma_code_step(c: Cfg, c2: Cfg)
+    requires cfg_wf(c), code_next(c, c2),
+    ensures cfg_wf(c2), exists|st: M::Step| M::next(cfg_d(c), cfg_n(c), abs_cfg(c), st, abs_cfg(c2)),
+{
+    let d = cfg_d(c); let n = cfg_n(c);
+    let (who, keep0) = choose|who: int, keep: bool| step_any(c, c2, who, keep);
+    let w = abs_cfg(c); let w2 = abs_cfg(c2);
+    assert(w.peers.len() == 2);
+    assert(cfg_peer_ok(c, who) && cfg_peer_ok(c, 1 - who));
+    if step_gen(c, c2, who) {
+        let (s1, r) = choose|s1: State, r: Option<Message>| gen_rel(c, c2, who, s1, r);
+        let a = c.a[who]; let p = abs_peer(a, c.s[who]);
+        assert(a_deps(a) == d && a_n(a) == n);
+        let (bloom, send) = choose|bloom: ISet<int>, send: ISet<int>| {
+            &&& a_doc(a).difference(M::closure(a_deps(a), a_n(a), vset(c.s[who].shared_heads@))).subset_of(bloom)
+            &&& (send == M::send_set(a_deps(a), a_n(a), p) || send == a_doc(a))
+            &&& abs_peer(a, s1) == (#[trigger] M::gen_s(a_deps(a), a_n(a), p, bloom, fake_of(c.s[who]), send)).0
+            &&& gen_msg_ok(p, r, M::gen_s(a_deps(a), a_n(a), p, bloom, fake_of(c.s[who]), send).1) };
+        let fake = fake_of(c.s[who]);
+        let st = if send == M::send_set(d, n, p) { M::Step::Gen { who, bloom, fake } } else { M::Step::GenDoc { who, bloom, fake } };
+        assert(M::next(d, n, w, st, w2)) by {
+            assert(p == w.peers[who]);
+            if send == M::send_set(d, n, p) { assert(M::gen_s(d, n, p, bloom, fake, send) == M::gen(d, n, p, bloom, fake)); }
+            let g = M::gen_s(d, n, p, bloom, fake, send);
+            assert(w2.peers =~= w.peers.update(who, g.0));
+            match r { Some(m) => { assert(g.1 == Some(abs_msg(m))); }, None => { assert(g.1 is None); } }
+        }
+        assert(cfg_wf(c2)) by { assert(c2.s.len() == 2 && c2.net.len() == 2); assert(cfg_peer_ok(c2, who)); assert(cfg_peer_ok(c2, 1 - who)); }
+    } else if step_recv(c, c2, who, keep0) {
+        let keep = keep0;
+        let (msg, a1, s1) = choose|msg: Message, a1: Automerge, s1: State| recv_rel(c, c2, who, keep, msg, a1, s1);
+        let p = abs_peer(c.a[who], c.s[who]); let m = abs_msg(msg); let s2 = a_doc(a1);
+        let st = M::Step::Recv { who, m, s2, keep };
+        assert(M::next(d, n, w, st, w2)) by {
+            assert(a_deps(c.a[who]) == d && a_n(c.a[who]) == n);
+            assert(w2.peers =~= w.peers.update(who, M::recv(d, n, p, m, s2)));
+        }
+        assert(cfg_wf(c2)) by {
+            assert(a_deps(a1) == d && a_n(a1) == n);
+            assert(c2.s.len() == 2 && c2.a.len() == 2 && c2.net.len() == 2);
+            assert(cfg_peer_ok(c2, who)); assert(cfg_peer_ok(c2, 1 - who));
+        }
+    } else if step_tmo(c, c2, who) {
+        let s1 = choose|s1: State| tmo_rel(c, c2, who, s1);
+        let st = M::Step::Timeout { who };
+        assert(M::next(d, n, w, st, w2)) by {
+            assert(abs_peer(c.a[who], s1) == M::tmo(abs_peer(c.a[who], c.s[who])));
+            assert(w2.peers =~= w.peers.update(who, M::tmo(w.peers[who])));
+        }
+        assert(cfg_wf(c2)) by { assert(cfg_peer_ok(c2, who)); assert(cfg_peer_ok(c2, 1 - who)); }
+    } else if step_drop(c, c2, who) {
+        let m = choose|m: M::Msg| drop_rel(c, c2, who, m);
+        let st = M::Step::Drop { who, m };
+        assert(M::next(d, n, w, st, w2)) by { assert(w2.peers =~= w.peers); }
+        assert(cfg_wf(c2));
+    } else {
+        let (a1, ch) = choose|a1: Automerge, ch: int| edit_rel(c, c2, who, a1, ch);
+        let st = M::Step::Edit { who, c: ch };
+        assert(M::next(d, n, w, st, w2)) by {
+            let p = w.peers[who];
+            assert(w2.peers =~= w.peers.update(who, M::Peer { doc: p.doc.insert(ch), ..p }));
+        }
+        assert(cfg_wf(c2)) by {
+            assert(cfg_peer_ok(c2, who)); assert(cfg_peer_ok(c2, 1 - who));
+            assert(vset(c.s[who].shared_heads@).subset_of(a_doc(a1)));
+        }
+    }
+}
+
+// A run: cs(0), cs(1), ..., cs(k), each step a code step.
+pub open spec fn code_run(cs: spec_fn(nat) -> Cfg, k: nat) -> bool {
+    cfg_wf(cs(0)) && forall|i: nat| i < k ==> #[trigger] code_next(cs(i), cs(i + 1))
+}
+// The start of a session: nothing in flight and nothing known about the peer (so the model's `inv` holds by a_wf).
+pub open spec fn session_start(c: Cfg) -> bool {
+    cfg_wf(c) && c.net[0] == ISet::<M::Msg>::empty() && c.net[1] == ISet::<M::Msg>::empty()
+    && c.s[0].their_heads is None && c.s[1].their_heads is None
+}
+pub proof fn lemma_session_inv(c: Cfg)
+    requires session_start(c), ensures M::inv(cfg_d(c), cfg_n(c), abs_cfg(c)),
+{
+    let d = cfg_d(c); let n = cfg_n(c); let w = abs_cfg(c);
+    assert(w.peers.len() == 2);
+    assert forall|i: int| 0 <= i < 2 implies M::peer_inv(d, n, w, i) by {
+        assert(cfg_peer_ok(c, i));
+        assert(a_deps(c.a[i]) == d);
+        assert(w.peers[i].their_heads is None);
+    }
+}
+// by induction: every configuration of a run satisfies cfg_wf and the model's safety invariant
+pub proof fn lemma_run_inv(cs: spec_fn(nat) -> Cfg, k: nat)
+    requires code_run(cs, k), session_start(cs(0)),
+    ensures cfg_wf(cs(k)), M::inv(cfg_d(cs(k)), cfg_n(cs(k)), abs_cfg(cs(k))), cfg_d(cs(k)) == cfg_d(cs(0)), cfg_n(cs(k)) == cfg_n(cs(0)),
+    decreases k,
+{
+    if k == 0 { lemma_session_inv(cs(0)); } else {
+        lemma_run_inv(cs, (k - 1) as nat);
+        let c = cs((k - 1) as nat); let c2 = cs(k);
+        let i = (k - 1) as nat;
+        assert(code_next(cs(i), cs(i + 1)));
+        assert(i + 1 == k);
+        lemma_code_step(c, c2);
+        let st = choose|st: M::Step| M::next(cfg_d(c), cfg_n(c), abs_cfg(c), st, abs_cfg(c2));
+        assert(M::wf(cfg_d(c), cfg_n(c)));
+        M::lemma_step(cfg_d(c), cfg_n(c), abs_cfg(c), st, abs_cfg(c2));
+        assert(cfg_d(c2) == cfg_d(c) && cfg_n(c2) == cfg_n(c)) by {
+            assert(a_deps(c2.a[0]) == a_deps(c2.a[0]));
+        }
+    }
+}
+// SAFETY OF THE CODE: in any run of the code from a session start, if at the end both peers are in the state in which
+// generate_sync_message answers None through its heads_equal branch (model: report_in_sync), the documents are equal.
+pub proof fn theorem_code_safety(cs: spec_fn(nat) -> Cfg, k: nat)
+    requires code_run(cs, k), session_start(cs(0)),
+        M::report_in_sync(cfg_d(cs(k)), cfg_n(cs(k)), abs_peer(cs(k).a[0], cs(k).s[0])),
+        M::report_in_sync(cfg_d(cs(k)), cfg_n(cs(k)), abs_peer(cs(k).a[1], cs(k).s[1])),
+    ensures a_doc(cs(k).a[0]) == a_doc(cs(k).a[1]),
+{
+    lemma_run_inv(cs, k);
+    let c = cs(k);
+    assert(M::wf(cfg_d(c), cfg_n(c)));
+    M::theorem_safety_inv(cfg_d(c), cfg_n(c), abs_cfg(c));
 }
 
 } // verus!

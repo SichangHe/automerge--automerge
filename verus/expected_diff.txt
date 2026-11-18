@@ -1,30 +1,25 @@
 === SyncDoc::generate_sync_message
 --- original sync.rs generate_sync_message
 +++ verus/conform.rs generate_sync_message
-@@ -1 +1,14 @@
+@@ -1 +1,9 @@
 -fn generate_sync_message(&self, sync_state: &mut State) -> Option<Message> {
 +pub fn generate_sync_message(&self, sync_state: &mut State) -> (r: Option<Message>)
 +requires a_wf(*self), st_wf(*old(sync_state), *self), gen_frag(*old(sync_state)),
-+ensures
-+st_wf(*final(sync_state), *self),
-+exists|bloom: ISet<int>| {
-+&&& a_doc(*self).difference(M::closure(a_deps(*self), a_n(*self), vset(old(sync_state).shared_heads@))).subset_of(bloom)
-+&&& abs_peer(*self, *final(sync_state)) == M::gen(a_deps(*self), a_n(*self), abs_peer(*self, *old(sync_state)), bloom, true).0
-+&&& gen_msg_ok(abs_peer(*self, *old(sync_state)), r, M::gen(a_deps(*self), a_n(*self), abs_peer(*self, *old(sync_state)), bloom, true).1)
-+},
++ensures gen_post(*self, *old(sync_state), *final(sync_state), r),
 +{
 +let ghost s0 = *sync_state;
 +let ghost d = a_deps(*self);
 +let ghost n = a_n(*self);
 +let ghost p = abs_peer(*self, s0);
-@@ -2,0 +16,2 @@
++let ghost fake = fake_of(s0);
+@@ -2,0 +11,2 @@
 +// CHANGE [C19]: `vec![]` needs a type; `missing_deps_from(sync_state.their_heads.iter().flatten().copied())`
 +// is `missing_deps_from(&sync_state.their_heads)` (see C7).
-@@ -4 +19,2 @@
+@@ -4 +14,2 @@
 -vec![]
 +let v: Vec<ChangeHash> = Vec::new();
 +v
-@@ -6,10 +22 @@
+@@ -6,10 +17 @@
 -// Only request what we need to reach the peer's advertised heads. This is
 -// deliberately not `get_missing_deps`, which reports the missing dependencies of
 -// _every_ queued change: the queue can contain orphans picked up from another peer
@@ -36,7 +31,7 @@
 -// them.
 -self.missing_deps_from(sync_state.their_heads.iter().flatten().copied())
 +self.missing_deps_from(&sync_state.their_heads)
-@@ -17,6 +24,2 @@
+@@ -17,6 +19,2 @@
 -let their_heads_set = if let Some(ref heads) = sync_state.their_heads {
 -heads.iter().collect::<HashSet<_>>()
 -} else {
@@ -45,7 +40,7 @@
 -let our_have = if our_need.iter().all(|hash| their_heads_set.contains(hash)) {
 +// CHANGE [C10]: the HashSet `their_heads_set` and `.all(..)` replaced by `all_in_opt`.
 +let our_have = if all_in_opt(&our_need, &sync_state.their_heads) {
-@@ -27,8 +30,23 @@
+@@ -27,8 +25,26 @@
 -if let Some(ref their_have) = sync_state.their_have {
 -if let Some(first_have) = their_have.first().as_ref() {
 -if !first_have
@@ -73,23 +68,27 @@
 +assert(abs_haves(rm.have@) =~= seq![M::Have { last_sync: ISet::empty(), bloom: ISet::empty() }]);
 +assert(vset(rm.heads@) == oh);
 +let r = Some(rm);
-+assert(abs_peer(*self, *sync_state) == M::gen(d, n, p, bloom, true).0);
-+assert(gen_msg_ok(p, r, M::gen(d, n, p, bloom, true).1));
++let ghost send0 = M::send_set(d, n, p);
++proof { M::lemma_reset_msg(oh); }
++assert(abs_peer(*self, *sync_state) == M::gen_s(d, n, p, bloom, fake, send0).0);
++assert(abs_msg(rm) =~= M::reset_msg(oh));
++assert(gen_msg_ok(p, r, M::gen_s(d, n, p, bloom, fake, send0).1));
 +assert(st_wf(*sync_state, *self));
 +return r;
-@@ -37,0 +56,3 @@
+@@ -37,0 +54,3 @@
 +assert(!M::must_reset(p)) by {
 +if let Some(h) = p.their_have { if h.len() > 0 { assert(h[0].last_sync == vset(s0.their_have->Some_0@[0].last_sync@)); } }
 +}
-@@ -39,3 +60 @@
+@@ -39,3 +58 @@
 -// The remote peer is read-only and will ignore incoming changes.
 -// Skip computing and sending changes to save bandwidth.
 -MessageBuilder::new(vec![], sync_state)
 +MessageBuilder::new(Vec::new(), sync_state)
-@@ -44 +63 @@
+@@ -44 +61,2 @@
 -let hashes = self.change_graph.get_hashes(&[]);
 +let hashes = self.change_graph.get_hashes(&Vec::new());
-@@ -50,5 +69,3 @@
++proof { lemma_reach_empty(d, n as nat); assert(vset(Seq::<u64>::empty()) =~= ISet::<int>::empty()); assert(vset(hashes@) =~= a_doc(*self)); }
+@@ -50,5 +68,3 @@
 -// deduplicate the changes to send with those we have already sent and clone it now
 -let hashes: Vec<_> = all_hashes
 -.into_iter()
@@ -98,10 +97,11 @@
 +proof { lemma_hts_subset(d, n, a_doc(*self), abs_haves(their_have@), vset(their_need@)); }
 +// CHANGE [C13]: filter/collect replaced by `filter_unsent`.
 +let hashes: Vec<_> = filter_unsent(all_hashes, &sync_state.sent_hashes);
-@@ -56,2 +73 @@
+@@ -56,2 +72,2 @@
 -// sending more than a 1/3 of the document?  send everything
 -let all_hashes = self.change_graph.get_hashes(&[]);
 +let all_hashes = self.change_graph.get_hashes(&Vec::new());
++proof { lemma_reach_empty(d, n as nat); assert(vset(Seq::<u64>::empty()) =~= ISet::<int>::empty()); assert(vset(all_hashes@) =~= a_doc(*self)); }
 @@ -60 +76,2 @@
 -let changes = self.get_changes_by_hashes(hashes.iter().copied()).ok()?;
 +// CHANGE [C20]: `.ok()?` -> match (the Err arm is excluded by T9).
@@ -112,10 +112,10 @@
 @@ -67,2 +84,25 @@
 -let heads_unchanged = sync_state.last_sent_heads == our_heads;
 -let heads_equal = sync_state.their_heads.as_ref() == Some(&our_heads);
-+let ghost send = M::send_set(d, n, p);
-+assert(mb_cset(message_builder) == send && vset(mb_hashes(message_builder)) == send) by {
-+assert(abs_haves(s0.their_have->Some_0@) =~= abs_haves(s0.their_have->Some_0@));
-+}
++// Path by path: the builder holds send_set (ordinary branch) or the whole document (send_doc / one-third rule).
++let ghost send = mb_cset(message_builder);
++proof { lemma_reach_empty(d, n as nat); }
++assert((send == M::send_set(d, n, p) || send == a_doc(*self)) && vset(mb_hashes(message_builder)) == send);
 +let heads_unchanged = vec_eq(&sync_state.last_sent_heads, &our_heads);
 +proof {
 +if heads_unchanged { assert(vset(s0.last_sent_heads@) == vset(our_heads@)); }
@@ -138,9 +138,9 @@
 +} else { if mb_hashes(message_builder).len() == 0 { assert(vset(mb_hashes(message_builder)) =~= ISet::<int>::empty()); } }
 +}
 @@ -70,0 +111 @@
-+assert(M::gen(d, n, p, bloom, true).1 is None);
++assert(M::gen_s(d, n, p, bloom, fake, send).1 is None);
 @@ -73,0 +115 @@
-+assert(M::gen(d, n, p, bloom, true).1 is None);
++assert(M::gen_s(d, n, p, bloom, fake, send).1 is None);
 @@ -78,2 +120,3 @@
 -sync_state.last_sent_heads.clone_from(&our_heads);
 -sync_state.sent_hashes.extend(message_builder.hashes());
@@ -160,8 +160,8 @@
 @@ -108,0 +146,4 @@
 +assert(opt_set_eq(s0.their_heads));
 +assert(vset(Seq::<u64>::empty()) =~= ISet::<int>::empty());
-+assert(abs_peer(*self, *sync_state) =~= M::gen(d, n, p, bloom, true).0);
-+assert(abs_msg(sync_message) =~= M::gen(d, n, p, bloom, true).1->Some_0);
++assert(abs_peer(*self, *sync_state) =~= M::gen_s(d, n, p, bloom, fake, send).0);
++assert(abs_msg(sync_message) =~= M::gen_s(d, n, p, bloom, fake, send).1->Some_0);
 === SyncDoc::receive_sync_message
 --- original sync.rs receive_sync_message
 +++ verus/conform.rs receive_sync_message
@@ -338,13 +338,15 @@
 === State::on_timeout
 --- original sync/state.rs on_timeout
 +++ verus/conform.rs on_timeout
-@@ -1 +1,4 @@
+@@ -1 +1,6 @@
 -pub fn on_timeout(&mut self) {
 +pub fn on_timeout(&mut self)
 +ensures
 +abs_state(*final(self)) == M::tmo(abs_state(*old(self))),
++final(self).read_only == old(self).read_only, final(self).peer_read_only == old(self).peer_read_only,
++forall|a: Automerge| st_wf(*final(self), a) == st_wf(*old(self), a),
 +{
-@@ -3,0 +7 @@
+@@ -3,0 +9 @@
 +proof { assert(bset(self.sent_hashes) =~= ISet::<int>::empty()); assert(abs_state(*self) =~= M::tmo(abs_state(*old(self)))); }
 === State::supports_v2_messages
 --- original sync/state.rs supports_v2_messages
