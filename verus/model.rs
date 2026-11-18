@@ -511,7 +511,7 @@ proof fn lemma_gen_props(d: Deps, n: int, p: Peer, bloom: ISet<int>, fake: bool)
         }
     }
 }
-proof fn lemma_gens_props(d: Deps, n: int, p: Peer, bloom: ISet<int>, fake: bool, send: ISet<int>)
+pub proof fn lemma_gens_props(d: Deps, n: int, p: Peer, bloom: ISet<int>, fake: bool, send: ISet<int>)
     requires send.subset_of(p.doc),
     ensures
         gen_s(d, n, p, bloom, fake, send).0.doc == p.doc, gen_s(d, n, p, bloom, fake, send).0.queue == p.queue,
@@ -519,7 +519,7 @@ proof fn lemma_gens_props(d: Deps, n: int, p: Peer, bloom: ISet<int>, fake: bool
         gen_s(d, n, p, bloom, fake, send).0.their_have == p.their_have,
         gen_s(d, n, p, bloom, fake, send).1 is Some ==> ({
             let m = gen_s(d, n, p, bloom, fake, send).1.unwrap();
-            m.changes.subset_of(p.doc)
+            m.changes.subset_of(p.doc) && m.have.len() <= 1
             && (forall|k: int| 0 <= k < m.have.len() ==> #[trigger] m.have[k].last_sync.subset_of(p.shared_heads))
         }),
 {
@@ -937,13 +937,21 @@ pub proof fn lemma_rel_step(d: Deps, n: int, w: World, st: Step, w2: World)
 pub struct RP {
     pub ba: ISet<int>, pub fa: bool, pub bb: ISet<int>, pub fb: bool,
     pub s2a: ISet<int>, pub s2b: ISet<int>, pub lossa: bool, pub lossb: bool,
+    // [vlm47#3] da/db: the peer's Gen in this round sends the whole document (GenDoc) instead of send_set
+    pub da: bool, pub db: bool,
+}
+pub open spec fn gstep(who: int, bloom: ISet<int>, fake: bool, isdoc: bool) -> Step {
+    if isdoc { Step::GenDoc { who, bloom, fake } } else { Step::Gen { who, bloom, fake } }
+}
+pub open spec fn gen_x(d: Deps, n: int, p: Peer, bloom: ISet<int>, fake: bool, isdoc: bool) -> (Peer, Option<Msg>) {
+    gen_s(d, n, p, bloom, fake, if isdoc { p.doc } else { send_set(d, n, p) })
 }
 pub open spec fn rw1(d: Deps, n: int, w: World) -> World { apply(d, n, w, Step::Timeout { who: 0 }) }
 pub open spec fn rw2(d: Deps, n: int, w: World) -> World { apply(d, n, rw1(d, n, w), Step::Timeout { who: 1 }) }
-pub open spec fn rw3(d: Deps, n: int, w: World, rp: RP) -> World { apply(d, n, rw2(d, n, w), Step::Gen { who: 0, bloom: rp.ba, fake: rp.fa }) }
-pub open spec fn rw4(d: Deps, n: int, w: World, rp: RP) -> World { apply(d, n, rw3(d, n, w, rp), Step::Gen { who: 1, bloom: rp.bb, fake: rp.fb }) }
-pub open spec fn msg_a(d: Deps, n: int, w: World, rp: RP) -> Option<Msg> { gen(d, n, rw2(d, n, w).peers[0], rp.ba, rp.fa).1 }
-pub open spec fn msg_b(d: Deps, n: int, w: World, rp: RP) -> Option<Msg> { gen(d, n, rw3(d, n, w, rp).peers[1], rp.bb, rp.fb).1 }
+pub open spec fn rw3(d: Deps, n: int, w: World, rp: RP) -> World { apply(d, n, rw2(d, n, w), gstep(0, rp.ba, rp.fa, rp.da)) }
+pub open spec fn rw4(d: Deps, n: int, w: World, rp: RP) -> World { apply(d, n, rw3(d, n, w, rp), gstep(1, rp.bb, rp.fb, rp.db)) }
+pub open spec fn msg_a(d: Deps, n: int, w: World, rp: RP) -> Option<Msg> { gen_x(d, n, rw2(d, n, w).peers[0], rp.ba, rp.fa, rp.da).1 }
+pub open spec fn msg_b(d: Deps, n: int, w: World, rp: RP) -> Option<Msg> { gen_x(d, n, rw3(d, n, w, rp).peers[1], rp.bb, rp.fb, rp.db).1 }
 pub open spec fn st5(rp: RP, m: Msg) -> Step {
     if rp.lossa { Step::Drop { who: 0, m } } else { Step::Recv { who: 1, m, s2: rp.s2b, keep: false } }
 }
@@ -959,8 +967,8 @@ pub open spec fn rw6(d: Deps, n: int, w: World, rp: RP) -> World {
 pub open spec fn rvalid(d: Deps, n: int, w: World, rp: RP) -> bool {
     guard(d, n, w, Step::Timeout { who: 0 })
     && guard(d, n, rw1(d, n, w), Step::Timeout { who: 1 })
-    && guard(d, n, rw2(d, n, w), Step::Gen { who: 0, bloom: rp.ba, fake: rp.fa })
-    && guard(d, n, rw3(d, n, w, rp), Step::Gen { who: 1, bloom: rp.bb, fake: rp.fb })
+    && guard(d, n, rw2(d, n, w), gstep(0, rp.ba, rp.fa, rp.da))
+    && guard(d, n, rw3(d, n, w, rp), gstep(1, rp.bb, rp.fb, rp.db))
     && (match msg_a(d, n, w, rp) { Some(m) => guard(d, n, rw4(d, n, w, rp), st5(rp, m)), None => true })
     && (match msg_b(d, n, w, rp) { Some(m) => guard(d, n, rw5(d, n, w, rp), st6(rp, m)), None => true })
 }
@@ -980,8 +988,8 @@ pub proof fn lemma_round(d: Deps, n: int, w: World, rp: RP)
     let w5 = rw5(d, n, w, rp); let w6 = rw6(d, n, w, rp);
     lemma_one(d, n, w, Step::Timeout { who: 0 }, w1);
     lemma_one(d, n, w1, Step::Timeout { who: 1 }, w2);
-    lemma_one(d, n, w2, Step::Gen { who: 0, bloom: rp.ba, fake: rp.fa }, w3);
-    lemma_one(d, n, w3, Step::Gen { who: 1, bloom: rp.bb, fake: rp.fb }, w4);
+    lemma_one(d, n, w2, gstep(0, rp.ba, rp.fa, rp.da), w3);
+    lemma_one(d, n, w3, gstep(1, rp.bb, rp.fb, rp.db), w4);
     lemma_rel_trans(w, w1, w2); lemma_rel_trans(w, w2, w3); lemma_rel_trans(w, w3, w4);
     match msg_a(d, n, w, rp) {
         Some(m) => { lemma_one(d, n, w4, st5(rp, m), w5); lemma_rel_trans(w, w4, w5); }
@@ -994,8 +1002,8 @@ pub proof fn lemma_round(d: Deps, n: int, w: World, rp: RP)
 }
 
 // peer-level view of a round
-pub open spec fn tga(d: Deps, n: int, w: World, rp: RP) -> (Peer, Option<Msg>) { gen(d, n, tmo(w.peers[0]), rp.ba, rp.fa) }
-pub open spec fn tgb(d: Deps, n: int, w: World, rp: RP) -> (Peer, Option<Msg>) { gen(d, n, tmo(w.peers[1]), rp.bb, rp.fb) }
+pub open spec fn tga(d: Deps, n: int, w: World, rp: RP) -> (Peer, Option<Msg>) { gen_x(d, n, tmo(w.peers[0]), rp.ba, rp.fa, rp.da) }
+pub open spec fn tgb(d: Deps, n: int, w: World, rp: RP) -> (Peer, Option<Msg>) { gen_x(d, n, tmo(w.peers[1]), rp.bb, rp.fb, rp.db) }
 pub open spec fn fin_b(d: Deps, n: int, w: World, rp: RP) -> Peer {
     match tga(d, n, w, rp).1 {
         Some(m) => if rp.lossa { tgb(d, n, w, rp).0 } else { recv(d, n, tgb(d, n, w, rp).0, m, rp.s2b) },
@@ -1088,17 +1096,31 @@ proof fn lemma_no_reset(d: Deps, n: int, w: World, i: int)
         None => {}
     }
 }
-proof fn lemma_gen_ns(d: Deps, n: int, p: Peer, bloom: ISet<int>, fake: bool)
+proof fn lemma_gen_ns(d: Deps, n: int, p: Peer, bloom: ISet<int>, fake: bool, isdoc: bool)
     requires !must_reset(p), !p.in_flight, p.their_heads != Some(heads(d, p.doc)),
     ensures
-        gen(d, n, p, bloom, fake).1 is Some,
-        ({ let m = gen(d, n, p, bloom, fake).1.unwrap();
+        gen_x(d, n, p, bloom, fake, isdoc).1 is Some,
+        ({ let m = gen_x(d, n, p, bloom, fake, isdoc).1.unwrap();
            m.heads == (if p.needs_reset && fake { ISet::<int>::empty() } else { heads(d, p.doc) })
            && m.need == missing(d, n, p.doc, p.queue, opt_set(p.their_heads))
-           && m.changes == send_set(d, n, p) }),
-        gen(d, n, p, bloom, fake).0.needs_reset == false,
-        gen(d, n, p, bloom, fake).0.their_heads == p.their_heads,
+           && m.changes == (if isdoc { p.doc } else { send_set(d, n, p) }) }),
+        gen_x(d, n, p, bloom, fake, isdoc).0.needs_reset == false,
+        gen_x(d, n, p, bloom, fake, isdoc).0.their_heads == p.their_heads,
 {}
+proof fn lemma_genx_props(d: Deps, n: int, p: Peer, bloom: ISet<int>, fake: bool, isdoc: bool)
+    ensures
+        gen_x(d, n, p, bloom, fake, isdoc).0.doc == p.doc, gen_x(d, n, p, bloom, fake, isdoc).0.queue == p.queue,
+        gen_x(d, n, p, bloom, fake, isdoc).0.shared_heads == p.shared_heads,
+        gen_x(d, n, p, bloom, fake, isdoc).0.their_have == p.their_have,
+        gen_x(d, n, p, bloom, fake, isdoc).1 is Some ==> ({
+            let m = gen_x(d, n, p, bloom, fake, isdoc).1.unwrap();
+            m.changes.subset_of(p.doc)
+            && (forall|k: int| 0 <= k < m.have.len() ==> #[trigger] m.have[k].last_sync.subset_of(p.shared_heads))
+        }),
+{
+    lemma_send_subset(d, n, p);
+    lemma_gens_props(d, n, p, bloom, fake, if isdoc { p.doc } else { send_set(d, n, p) });
+}
 
 // ---- walk / missing
 proof fn lemma_walk_notin(d: Deps, s: ISet<int>, q: ISet<int>, st: ISet<int>, k: nat, x: int)
@@ -1171,6 +1193,7 @@ proof fn lemma_exists_missing(d: Deps, n: int, sa: ISet<int>, qa: ISet<int>, sb:
 // ---- round facts
 pub open spec fn tg(d: Deps, n: int, w: World, rp: RP, c: int) -> (Peer, Option<Msg>) { if c == 0 { tga(d, n, w, rp) } else { tgb(d, n, w, rp) } }
 pub open spec fn fin(d: Deps, n: int, w: World, rp: RP, c: int) -> Peer { if c == 0 { fin_a(d, n, w, rp) } else { fin_b(d, n, w, rp) } }
+pub open spec fn isdoc(rp: RP, c: int) -> bool { if c == 0 { rp.da } else { rp.db } }
 pub open spec fn flag(rp: RP, c: int) -> bool { if c == 0 { rp.fa } else { rp.fb } }
 
 proof fn lemma_rw4(d: Deps, n: int, w: World, rp: RP)
@@ -1193,7 +1216,7 @@ pub proof fn lemma_msg_of(d: Deps, n: int, w: World, rp: RP, c: int)
            let fo = fin(d, n, w, rp, 1 - c);
            m.heads == (if pc.needs_reset && flag(rp, c) { ISet::<int>::empty() } else { heads(d, pc.doc) })
            && m.need == missing(d, n, pc.doc, pc.queue, opt_set(pc.their_heads))
-           && m.changes == send_set(d, n, tmo(pc))
+           && m.changes == (if isdoc(rp, c) { pc.doc } else { send_set(d, n, tmo(pc)) })
            && fo.their_heads == Some(m.heads) && fo.their_need == Some(m.need) && fo.their_have == Some(m.have)
            && (forall|x: int| m.changes.contains(x) ==> fo.doc.contains(x) || fo.queue.contains(x)) }),
         fin(d, n, w, rp, c).needs_reset == false,
@@ -1202,8 +1225,8 @@ pub proof fn lemma_msg_of(d: Deps, n: int, w: World, rp: RP, c: int)
     let pc = w.peers[c];
     let t = tmo(pc);
     assert(!must_reset(t));
-    lemma_gen_ns(d, n, t, if c == 0 { rp.ba } else { rp.bb }, flag(rp, c));
-    lemma_gen_props(d, n, t, if c == 0 { rp.ba } else { rp.bb }, flag(rp, c));
+    lemma_gen_ns(d, n, t, if c == 0 { rp.ba } else { rp.bb }, flag(rp, c), isdoc(rp, c));
+    lemma_genx_props(d, n, t, if c == 0 { rp.ba } else { rp.bb }, flag(rp, c), isdoc(rp, c));
     lemma_rw4(d, n, w, rp);
     let g = tg(d, n, w, rp, c);
     let m = g.1.unwrap();
@@ -1360,7 +1383,7 @@ proof fn lemma_s_send(d: Deps, n: int, w: World, rp: RP, a: int, x: int)
     match (pb.their_have, pb.their_need) {
         (Some(h), Some(nd)) => {
             lemma_send_has_need(d, n, pb.doc, h, nd, x);
-            assert(send_set(d, n, t).contains(x));
+            if !isdoc(rp, b) { assert(send_set(d, n, t).contains(x)); }
         }
         _ => { assert(false); }
     }
@@ -1444,11 +1467,11 @@ pub proof fn lemma_round_exists(d: Deps, n: int, w: World)
     assert(inv(d, n, w) && xinv(d, n, w));
     assert(peer_inv(d, n, w, 0) && peer_inv(d, n, w, 1) && xinv_p(d, n, w, 0) && xinv_p(d, n, w, 1));
     let e = ISet::<int>::empty();
-    let rp0 = RP { ba: w.peers[0].doc, fa: false, bb: w.peers[1].doc, fb: false, s2a: e, s2b: e, lossa: false, lossb: false };
+    let rp0 = RP { ba: w.peers[0].doc, fa: false, bb: w.peers[1].doc, fb: false, s2a: e, s2b: e, lossa: false, lossb: false, da: false, db: false };
     let w1 = rw1(d, n, w); let w2 = rw2(d, n, w); let w3 = rw3(d, n, w, rp0); let w4 = rw4(d, n, w, rp0);
     assert(w2.peers[0] == tmo(w.peers[0]) && w2.peers[1] == tmo(w.peers[1]) && w2.peers.len() == 2);
-    lemma_gen_props(d, n, tmo(w.peers[0]), rp0.ba, rp0.fa);
-    lemma_gen_props(d, n, tmo(w.peers[1]), rp0.bb, rp0.fb);
+    lemma_genx_props(d, n, tmo(w.peers[0]), rp0.ba, rp0.fa, false);
+    lemma_genx_props(d, n, tmo(w.peers[1]), rp0.bb, rp0.fb, false);
     lemma_rw4(d, n, w, rp0);
     let ga = tga(d, n, w, rp0); let gb = tgb(d, n, w, rp0);
     assert(w4.peers[0].doc == w.peers[0].doc && w4.peers[0].queue == w.peers[0].queue);
@@ -1658,8 +1681,8 @@ pub proof fn lemma_round_is_model_steps(d: Deps, n: int, w: World, rp: RP)
     ensures
         next(d, n, w, Step::Timeout { who: 0 }, rw1(d, n, w)),
         next(d, n, rw1(d, n, w), Step::Timeout { who: 1 }, rw2(d, n, w)),
-        next(d, n, rw2(d, n, w), Step::Gen { who: 0, bloom: rp.ba, fake: rp.fa }, rw3(d, n, w, rp)),
-        next(d, n, rw3(d, n, w, rp), Step::Gen { who: 1, bloom: rp.bb, fake: rp.fb }, rw4(d, n, w, rp)),
+        next(d, n, rw2(d, n, w), gstep(0, rp.ba, rp.fa, rp.da), rw3(d, n, w, rp)),
+        next(d, n, rw3(d, n, w, rp), gstep(1, rp.bb, rp.fb, rp.db), rw4(d, n, w, rp)),
         (match msg_a(d, n, w, rp) { Some(m) => next(d, n, rw4(d, n, w, rp), st5(rp, m), rw5(d, n, w, rp)), None => true }),
         (match msg_b(d, n, w, rp) { Some(m) => next(d, n, rw5(d, n, w, rp), st6(rp, m), rw6(d, n, w, rp)), None => true }),
 {}

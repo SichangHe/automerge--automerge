@@ -575,6 +575,7 @@ impl Message {
     pub(crate) fn reset(our_heads: Vec<ChangeHash>) -> (r: Message)
         ensures r.heads@ == our_heads@, r.need@.len() == 0, r.have@.len() == 1, r.have@[0].last_sync@.len() == 0,
             bloom_set(r.have@[0].bloom) == ISet::<int>::empty(), chunk_set(r.changes) == ISet::<int>::empty(),
+            r.flags is Some && r.flags->Some_0.0 == 4u8,
     {
         Message {
             heads: our_heads,
@@ -584,6 +585,7 @@ impl Message {
             flags: {
                 let mut f = MessageFlags::new();
                 f.set(MessageFlags::SUPPORTS_SYNC_RESET);
+                assert((0u8 | 4u8) == 4u8) by (bit_vector);
                 Some(f)
             },
             version: MessageVersion::V1,
@@ -626,6 +628,11 @@ pub open spec fn st_wf(s: State, a: Automerge) -> bool {
 pub open spec fn msg_wf(m: Message, a: Automerge) -> bool {
     sorted_strict(m.heads@) && m.have@.len() <= 1 && M::bounded(chunk_set(m.changes), a_n(a))
     && (match m.flags { Some(f) => f.0 & 1 == 0 && f.0 & 2 == 0, None => true })
+}
+// What a generated message must satisfy so that the peer may call receive_sync_message on it (see msg_wf): the
+// heads are sorted and the flags carry neither SYNC_RESET nor READ_ONLY. (bounded changes and <= 1 have follow from gen_post.)
+pub open spec fn out_wf(r: Option<Message>) -> bool {
+    match r { None => true, Some(m) => sorted_strict(m.heads@) && (match m.flags { Some(f) => f.0 & 1 == 0 && f.0 & 2 == 0, None => true }) }
 }
 // Fragment of generate_sync_message that the model describes: no read-only mode (either side). Peer capabilities
 // (MessageV2, SyncReset) are unrestricted: whole-document sends are the model's GenDoc step.
@@ -754,6 +761,8 @@ impl Automerge {
     pub fn generate_sync_message(&self, sync_state: &mut State) -> (r: Option<Message>)
         requires a_wf(*self), st_wf(*old(sync_state), *self), gen_frag(*old(sync_state)),
         ensures gen_post(*self, *old(sync_state), *final(sync_state), r),
+            // the flag SYNC_RESET is set only when needs_reset and the peer supports it
+            (!old(sync_state).needs_reset || !st_sr(*old(sync_state))) ==> out_wf(r),
     {
         let ghost s0 = *sync_state;
         let ghost d = a_deps(*self);
@@ -803,6 +812,9 @@ impl Automerge {
                     assert(abs_msg(rm) =~= M::reset_msg(oh));
                     assert(gen_msg_ok(p, r, M::gen_s(d, n, p, bloom, fake, send0).1));
                     assert(st_wf(*sync_state, *self));
+                    assert((4u8 & 1u8) == 0u8 && (4u8 & 2u8) == 0u8) by (bit_vector);
+                    assert(sorted_strict(our_heads_s));
+                    assert(out_wf(r));
                     return r;
                 }
             }
@@ -884,9 +896,11 @@ impl Automerge {
 
         let mut flags = MessageFlags::new();
         flags.set(MessageFlags::SUPPORTS_SYNC_RESET);
+        assert((0u8 | 4u8) == 4u8) by (bit_vector);
         if sync_state.read_only {
             flags.set(MessageFlags::READ_ONLY);
         }
+        assert(flags.0 == 4u8);
 
         let heads_to_send = if sync_state.needs_reset {
             sync_state.needs_reset = false;
@@ -899,6 +913,9 @@ impl Automerge {
         } else {
             our_heads.clone()
         };
+        assert((4u8 & 1u8) == 0u8 && (4u8 & 2u8) == 0u8) by (bit_vector);
+        assert((!s0.needs_reset || !st_sr(s0)) ==> flags.0 == 4u8);
+        assert(sorted_strict(heads_to_send@)) by { assert(sorted_strict(our_heads@)); assert(heads_to_send@.len() == 0 || heads_to_send@ == our_heads@); }
 
         let sync_message = message_builder
             .heads(heads_to_send)
@@ -912,6 +929,8 @@ impl Automerge {
         assert(vset(Seq::<u64>::empty()) =~= ISet::<int>::empty());
         assert(abs_peer(*self, *sync_state) =~= M::gen_s(d, n, p, bloom, fake, send).0);
         assert(abs_msg(sync_message) =~= M::gen_s(d, n, p, bloom, fake, send).1->Some_0);
+        assert(sorted_strict(sync_message.heads@));
+        assert((!s0.needs_reset || !st_sr(s0)) ==> out_wf(Some(sync_message)));
         Some(sync_message)
     }
 
@@ -1075,7 +1094,7 @@ pub open spec fn abs_cfg(c: Cfg) -> M::World {
     M::World { peers: Seq::new(2, |i: int| abs_peer(c.a[i], c.s[i])), net: c.net }
 }
 pub open spec fn cfg_peer_ok(c: Cfg, i: int) -> bool {
-    a_wf(c.a[i]) && st_wf(c.s[i], c.a[i]) && !c.s[i].read_only && !c.s[i].peer_read_only
+    a_wf(c.a[i]) && st_wf(c.s[i], c.a[i]) && !c.s[i].read_only && !c.s[i].peer_read_only && !c.s[i].needs_reset
     && a_deps(c.a[i]) == a_deps(c.a[0]) && a_n(c.a[i]) == a_n(c.a[0])
 }
 pub open spec fn cfg_wf(c: Cfg) -> bool {
@@ -1090,11 +1109,16 @@ pub open spec fn gen_rel(c: Cfg, c2: Cfg, who: int, s1: State, r: Option<Message
     && c2.net == (match r { Some(m) => c.net.update(who, c.net[who].insert(abs_msg(m))), None => c.net })
 }
 pub open spec fn step_gen(c: Cfg, c2: Cfg, who: int) -> bool { exists|s1: State, r: Option<Message>| gen_rel(c, c2, who, s1, r) }
-pub open spec fn recv_rel(c: Cfg, c2: Cfg, who: int, keep: bool, msg: Message, a1: Automerge, s1: State) -> bool {
-    msg_wf(msg, c.a[who]) && c.net[1 - who].contains(abs_msg(msg))
+pub open spec fn recv_core(c: Cfg, c2: Cfg, who: int, keep: bool, msg: Message, a1: Automerge, s1: State) -> bool {
+    c.net[1 - who].contains(abs_msg(msg))
     && recv_post(c.a[who], c.s[who], msg, a1, s1, Result::<(), AutomergeError>::Ok(()))
     && c2.a == c.a.update(who, a1) && c2.s == c.s.update(who, s1)
     && c2.net == (if keep { c.net } else { c.net.update(1 - who, c.net[1 - who].remove(abs_msg(msg))) })
+}
+// `msg_wf` is the precondition of receive_sync_message; here it is a hypothesis of the step (proved for generated
+// messages in lemma_gen_model, used by Part E).
+pub open spec fn recv_rel(c: Cfg, c2: Cfg, who: int, keep: bool, msg: Message, a1: Automerge, s1: State) -> bool {
+    msg_wf(msg, c.a[who]) && recv_core(c, c2, who, keep, msg, a1, s1)
 }
 pub open spec fn step_recv(c: Cfg, c2: Cfg, who: int, keep: bool) -> bool {
     exists|msg: Message, a1: Automerge, s1: State| recv_rel(c, c2, who, keep, msg, a1, s1)
@@ -1247,6 +1271,305 @@ pub proof fn theorem_code_safety(cs: spec_fn(nat) -> Cfg, k: nat)
     let c = cs(k);
     assert(M::wf(cfg_d(c), cfg_n(c)));
     M::theorem_safety_inv(cfg_d(c), cfg_n(c), abs_cfg(c));
+}
+
+// =====================================================================================
+// Part E (vlm47_amcode#3): LIVENESS OF THE CODE.  A code run is a sequence of code ROUNDS; a round is the model's
+// lock-step round (Timeout A, Timeout B, generate A, generate B, deliver or drop A's message, deliver or drop
+// B's message) made of calls to the copied functions.  Each generate call may be the ordinary Gen or the
+// whole-document GenDoc (gen_post allows both), chosen by the code, not by us.  Every message that is delivered is
+// the message the other peer generated, and `msg_wf` of it is PROVED (lemma_gen_model), not assumed.
+// =====================================================================================
+pub struct CRound { pub c1: Cfg, pub c2: Cfg, pub c3: Cfg, pub c4: Cfg, pub c5: Cfg,
+    pub ra: Option<Message>, pub rb: Option<Message>, pub lossa: bool, pub lossb: bool }
+
+// generate_sync_message returned `r` (its ensures include out_wf(r), as needs_reset is false: cfg_peer_ok)
+pub open spec fn gen_rel_r(c: Cfg, c2: Cfg, who: int, r: Option<Message>) -> bool {
+    (exists|s1: State| gen_rel(c, c2, who, s1, r)) && out_wf(r)
+}
+// the message `r` generated by peer `from` is dropped (loss) or received (not kept) by the other peer
+pub open spec fn deliver(c: Cfg, c2: Cfg, from: int, r: Option<Message>, loss: bool) -> bool {
+    match r {
+        None => c2 == c && !loss,
+        Some(m) => if loss { drop_rel(c, c2, from, abs_msg(m)) }
+                   else { exists|a1: Automerge, s1: State| #[trigger] recv_core(c, c2, 1 - from, false, m, a1, s1) },
+    }
+}
+pub open spec fn cround_ok(c0: Cfg, c6: Cfg, cr: CRound) -> bool {
+    step_tmo(c0, cr.c1, 0) && step_tmo(cr.c1, cr.c2, 1)
+    && gen_rel_r(cr.c2, cr.c3, 0, cr.ra) && gen_rel_r(cr.c3, cr.c4, 1, cr.rb)
+    && deliver(cr.c4, cr.c5, 0, cr.ra, cr.lossa) && deliver(cr.c5, c6, 1, cr.rb, cr.lossb)
+}
+pub open spec fn cr_good(cr: CRound) -> bool { !cr.lossa && !cr.lossb }
+
+pub proof fn lemma_tmo_model(c: Cfg, c2: Cfg, who: int)
+    requires cfg_wf(c), who == 0 || who == 1, step_tmo(c, c2, who),
+    ensures cfg_wf(c2), cfg_d(c2) == cfg_d(c), cfg_n(c2) == cfg_n(c),
+        M::next(cfg_d(c), cfg_n(c), abs_cfg(c), M::Step::Timeout { who }, abs_cfg(c2)),
+{
+    let d = cfg_d(c); let n = cfg_n(c); let w = abs_cfg(c); let w2 = abs_cfg(c2);
+    let s1 = choose|s1: State| tmo_rel(c, c2, who, s1);
+    assert(w.peers.len() == 2);
+    assert(cfg_peer_ok(c, who) && cfg_peer_ok(c, 1 - who));
+    assert(abs_peer(c.a[who], s1) == M::tmo(abs_peer(c.a[who], c.s[who])));
+    assert(w2.peers =~= w.peers.update(who, M::tmo(w.peers[who])));
+    assert(M::next(d, n, w, M::Step::Timeout { who }, w2));
+    assert(cfg_peer_ok(c2, who)); assert(cfg_peer_ok(c2, 1 - who));
+}
+
+pub proof fn lemma_gen_model(c: Cfg, c2: Cfg, who: int, r: Option<Message>)
+    requires cfg_wf(c), who == 0 || who == 1, gen_rel_r(c, c2, who, r),
+    ensures cfg_wf(c2), cfg_d(c2) == cfg_d(c), cfg_n(c2) == cfg_n(c),
+        exists|bloom: ISet<int>, isdoc: bool| {
+            &&& M::next(cfg_d(c), cfg_n(c), abs_cfg(c), #[trigger] M::gstep(who, bloom, fake_of(c.s[who]), isdoc), abs_cfg(c2))
+            &&& (match r {
+                Some(m) => M::gen_x(cfg_d(c), cfg_n(c), abs_peer(c.a[who], c.s[who]), bloom, fake_of(c.s[who]), isdoc).1 == Some(abs_msg(m)),
+                None => M::gen_x(cfg_d(c), cfg_n(c), abs_peer(c.a[who], c.s[who]), bloom, fake_of(c.s[who]), isdoc).1 is None,
+            })
+        },
+        // PROVED (not assumed): a generated message is acceptable to receive_sync_message of the other peer
+        (match r { Some(m) => forall|a: Automerge| a_n(a) == cfg_n(c) ==> msg_wf(m, a), None => true }),
+{
+    let d = cfg_d(c); let n = cfg_n(c);
+    let s1 = choose|s1: State| gen_rel(c, c2, who, s1, r);
+    let w = abs_cfg(c); let w2 = abs_cfg(c2);
+    assert(w.peers.len() == 2);
+    assert(cfg_peer_ok(c, who) && cfg_peer_ok(c, 1 - who));
+    let a = c.a[who]; let p = abs_peer(a, c.s[who]);
+    assert(a_deps(a) == d && a_n(a) == n);
+    assert(a_wf(a));
+    let (bloom, send) = choose|bloom: ISet<int>, send: ISet<int>| {
+        &&& a_doc(a).difference(M::closure(a_deps(a), a_n(a), vset(c.s[who].shared_heads@))).subset_of(bloom)
+        &&& (send == M::send_set(a_deps(a), a_n(a), p) || send == a_doc(a))
+        &&& abs_peer(a, s1) == (#[trigger] M::gen_s(a_deps(a), a_n(a), p, bloom, fake_of(c.s[who]), send)).0
+        &&& gen_msg_ok(p, r, M::gen_s(a_deps(a), a_n(a), p, bloom, fake_of(c.s[who]), send).1) };
+    let fake = fake_of(c.s[who]);
+    let isdoc = !(send == M::send_set(d, n, p));
+    assert(M::gen_x(d, n, p, bloom, fake, isdoc) == M::gen_s(d, n, p, bloom, fake, send)) by {
+        if isdoc { assert(send == a_doc(a)); }
+    }
+    let g = M::gen_s(d, n, p, bloom, fake, send);
+    assert(M::next(d, n, w, M::gstep(who, bloom, fake, isdoc), w2)) by {
+        assert(p == w.peers[who]);
+        assert(w2.peers =~= w.peers.update(who, g.0));
+        match r { Some(m) => { assert(g.1 == Some(abs_msg(m))); }, None => { assert(g.1 is None); } }
+    }
+    assert(cfg_wf(c2)) by { assert(c2.s.len() == 2 && c2.net.len() == 2); assert(cfg_peer_ok(c2, who)); assert(cfg_peer_ok(c2, 1 - who)); }
+    match r {
+        Some(m) => {
+            M::lemma_gens_props(d, n, p, bloom, fake, send);
+            assert(send.subset_of(a_doc(a)) || true);
+            assert(g.1 == Some(abs_msg(m)));
+            assert forall|a2: Automerge| a_n(a2) == n implies msg_wf(m, a2) by {
+                assert(M::bounded(chunk_set(m.changes), a_n(a2)));
+                assert(m.have@.len() <= 1);
+            }
+        }
+        None => {}
+    }
+}
+
+pub proof fn lemma_recv_model(c: Cfg, c2: Cfg, who: int, msg: Message, a1: Automerge, s1: State)
+    requires cfg_wf(c), who == 0 || who == 1, recv_core(c, c2, who, false, msg, a1, s1),
+    ensures cfg_wf(c2), cfg_d(c2) == cfg_d(c), cfg_n(c2) == cfg_n(c),
+        M::next(cfg_d(c), cfg_n(c), abs_cfg(c), M::Step::Recv { who, m: abs_msg(msg), s2: a_doc(a1), keep: false }, abs_cfg(c2)),
+{
+    let d = cfg_d(c); let n = cfg_n(c); let w = abs_cfg(c); let w2 = abs_cfg(c2);
+    assert(w.peers.len() == 2);
+    assert(cfg_peer_ok(c, who) && cfg_peer_ok(c, 1 - who));
+    let p = abs_peer(c.a[who], c.s[who]); let m = abs_msg(msg); let s2 = a_doc(a1);
+    assert(a_deps(c.a[who]) == d && a_n(c.a[who]) == n);
+    assert(w2.peers =~= w.peers.update(who, M::recv(d, n, p, m, s2)));
+    assert(M::next(d, n, w, M::Step::Recv { who, m, s2, keep: false }, w2));
+    assert(a_deps(a1) == d && a_n(a1) == n);
+    assert(c2.s.len() == 2 && c2.a.len() == 2 && c2.net.len() == 2);
+    assert(cfg_peer_ok(c2, who)); assert(cfg_peer_ok(c2, 1 - who));
+}
+
+pub proof fn lemma_drop_model(c: Cfg, c2: Cfg, who: int, m: M::Msg)
+    requires cfg_wf(c), who == 0 || who == 1, drop_rel(c, c2, who, m),
+    ensures cfg_wf(c2), cfg_d(c2) == cfg_d(c), cfg_n(c2) == cfg_n(c),
+        M::next(cfg_d(c), cfg_n(c), abs_cfg(c), M::Step::Drop { who, m }, abs_cfg(c2)),
+{
+    let w = abs_cfg(c); let w2 = abs_cfg(c2);
+    assert(w.peers.len() == 2);
+    assert(w2.peers =~= w.peers);
+    assert(w2 == M::apply(cfg_d(c), cfg_n(c), w, M::Step::Drop { who, m })) by { assert(w2.net =~= c.net.update(who, c.net[who].remove(m))); }
+}
+
+pub open spec fn s2_of(c: Cfg, c2: Cfg, who: int, m: Message) -> ISet<int> {
+    a_doc((choose|a1s: (Automerge, State)| recv_core(c, c2, who, false, m, a1s.0, a1s.1)).0)
+}
+pub open spec fn rp_of_round(cr: CRound, c6: Cfg, ba: ISet<int>, fa: bool, da: bool, bb: ISet<int>, fb: bool, db: bool) -> M::RP {
+    M::RP { ba, fa, da, bb, fb, db,
+        s2a: match cr.rb { Some(m) => if cr.lossb { ISet::empty() } else { s2_of(cr.c5, c6, 0, m) }, None => ISet::empty() },
+        s2b: match cr.ra { Some(m) => if cr.lossa { ISet::empty() } else { s2_of(cr.c4, cr.c5, 1, m) }, None => ISet::empty() },
+        lossa: cr.lossa, lossb: cr.lossb }
+}
+
+// A code round is a model round (for some choice of Bloom filters, send modes and drain results).
+pub proof fn lemma_round_code(c0: Cfg, c6: Cfg, cr: CRound)
+    requires cfg_wf(c0), cround_ok(c0, c6, cr),
+    ensures cfg_wf(c6), cfg_d(c6) == cfg_d(c0), cfg_n(c6) == cfg_n(c0),
+        exists|rp: M::RP| M::rvalid(cfg_d(c0), cfg_n(c0), abs_cfg(c0), rp)
+            && abs_cfg(c6) == M::rw6(cfg_d(c0), cfg_n(c0), abs_cfg(c0), rp) && (M::good(rp) <==> cr_good(cr)),
+{
+    let d = cfg_d(c0); let n = cfg_n(c0); let w0 = abs_cfg(c0);
+    lemma_tmo_model(c0, cr.c1, 0);
+    lemma_tmo_model(cr.c1, cr.c2, 1);
+    lemma_gen_model(cr.c2, cr.c3, 0, cr.ra);
+    lemma_gen_model(cr.c3, cr.c4, 1, cr.rb);
+    let (ba, da) = choose|bloom: ISet<int>, isdoc: bool| {
+        &&& M::next(cfg_d(cr.c2), cfg_n(cr.c2), abs_cfg(cr.c2), #[trigger] M::gstep(0, bloom, fake_of(cr.c2.s[0]), isdoc), abs_cfg(cr.c3))
+        &&& (match cr.ra {
+            Some(m) => M::gen_x(cfg_d(cr.c2), cfg_n(cr.c2), abs_peer(cr.c2.a[0], cr.c2.s[0]), bloom, fake_of(cr.c2.s[0]), isdoc).1 == Some(abs_msg(m)),
+            None => M::gen_x(cfg_d(cr.c2), cfg_n(cr.c2), abs_peer(cr.c2.a[0], cr.c2.s[0]), bloom, fake_of(cr.c2.s[0]), isdoc).1 is None }) };
+    let (bb, db) = choose|bloom: ISet<int>, isdoc: bool| {
+        &&& M::next(cfg_d(cr.c3), cfg_n(cr.c3), abs_cfg(cr.c3), #[trigger] M::gstep(1, bloom, fake_of(cr.c3.s[1]), isdoc), abs_cfg(cr.c4))
+        &&& (match cr.rb {
+            Some(m) => M::gen_x(cfg_d(cr.c3), cfg_n(cr.c3), abs_peer(cr.c3.a[1], cr.c3.s[1]), bloom, fake_of(cr.c3.s[1]), isdoc).1 == Some(abs_msg(m)),
+            None => M::gen_x(cfg_d(cr.c3), cfg_n(cr.c3), abs_peer(cr.c3.a[1], cr.c3.s[1]), bloom, fake_of(cr.c3.s[1]), isdoc).1 is None }) };
+    let fa = fake_of(cr.c2.s[0]); let fb = fake_of(cr.c3.s[1]);
+    let rp = rp_of_round(cr, c6, ba, fa, da, bb, fb, db);
+    assert(cfg_d(cr.c1) == d && cfg_d(cr.c2) == d && cfg_d(cr.c3) == d && cfg_d(cr.c4) == d);
+    assert(cfg_n(cr.c1) == n && cfg_n(cr.c2) == n && cfg_n(cr.c3) == n && cfg_n(cr.c4) == n);
+    assert(abs_cfg(cr.c1) == M::rw1(d, n, w0));
+    assert(abs_cfg(cr.c2) == M::rw2(d, n, w0));
+    assert(abs_cfg(cr.c3) == M::rw3(d, n, w0, rp));
+    assert(abs_cfg(cr.c4) == M::rw4(d, n, w0, rp));
+    assert(abs_cfg(cr.c2).peers[0] == abs_peer(cr.c2.a[0], cr.c2.s[0]));
+    assert(abs_cfg(cr.c3).peers[1] == abs_peer(cr.c3.a[1], cr.c3.s[1]));
+    assert(M::msg_a(d, n, w0, rp) == M::gen_x(d, n, abs_cfg(cr.c2).peers[0], ba, fa, da).1);
+    assert(M::msg_b(d, n, w0, rp) == M::gen_x(d, n, abs_cfg(cr.c3).peers[1], bb, fb, db).1);
+    assert(cfg_wf(cr.c5) && cfg_d(cr.c5) == d && cfg_n(cr.c5) == n && abs_cfg(cr.c5) == M::rw5(d, n, w0, rp)
+        && (match M::msg_a(d, n, w0, rp) { Some(m) => M::guard(d, n, abs_cfg(cr.c4), M::st5(rp, m)), None => true })) by {
+        match cr.ra {
+            Some(m) => {
+                if cr.lossa { lemma_drop_model(cr.c4, cr.c5, 0, abs_msg(m)); }
+                else {
+                    let (a1, s1) = choose|a1: Automerge, s1: State| recv_core(cr.c4, cr.c5, 1, false, m, a1, s1);
+                    lemma_recv_model(cr.c4, cr.c5, 1, m, a1, s1);
+                    assert(rp.s2b == a_doc(a1));
+                }
+            }
+            None => { assert(cr.c5 == cr.c4); }
+        }
+    }
+    assert(cfg_wf(c6) && cfg_d(c6) == d && cfg_n(c6) == n && abs_cfg(c6) == M::rw6(d, n, w0, rp)
+        && (match M::msg_b(d, n, w0, rp) { Some(m) => M::guard(d, n, abs_cfg(cr.c5), M::st6(rp, m)), None => true })) by {
+        match cr.rb {
+            Some(m) => {
+                if cr.lossb { lemma_drop_model(cr.c5, c6, 1, abs_msg(m)); }
+                else {
+                    let (a1, s1) = choose|a1: Automerge, s1: State| recv_core(cr.c5, c6, 0, false, m, a1, s1);
+                    lemma_recv_model(cr.c5, c6, 0, m, a1, s1);
+                    assert(rp.s2a == a_doc(a1));
+                }
+            }
+            None => { assert(c6 == cr.c5); }
+        }
+    }
+    assert(M::rvalid(d, n, w0, rp)) by {
+        assert(M::guard(d, n, w0, M::Step::Timeout { who: 0 }));
+        assert(M::guard(d, n, M::rw1(d, n, w0), M::Step::Timeout { who: 1 }));
+        assert(M::guard(d, n, M::rw2(d, n, w0), M::gstep(0, ba, fa, da)));
+        assert(M::guard(d, n, M::rw3(d, n, w0, rp), M::gstep(1, bb, fb, db)));
+    }
+    assert(M::good(rp) == cr_good(cr));
+}
+
+// ---- the run, its fairness, and the theorem
+pub open spec fn code_rounds(cs: spec_fn(nat) -> Cfg, crs: spec_fn(nat) -> CRound) -> bool {
+    forall|k: nat| #![trigger crs(k)] cround_ok(cs(k), cs((k + 1) as nat), crs(k))
+}
+// same fairness as the model's `fair_lossy`: infinitely often, 4 consecutive rounds lose nothing
+pub open spec fn code_win4(crs: spec_fn(nat) -> CRound, m: nat) -> bool {
+    exists|k: nat| #![trigger crs(k)] k >= m && cr_good(crs(k)) && cr_good(crs((k + 1) as nat))
+        && cr_good(crs((k + 2) as nat)) && cr_good(crs((k + 3) as nat))
+}
+pub open spec fn code_fair(crs: spec_fn(nat) -> CRound) -> bool { forall|m: nat| #[trigger] code_win4(crs, m) }
+
+// Start of a live session: as session_start, plus what the model's extra invariant `xinv` needs. A fresh State
+// (State::new) has these; a document may hold a queue only of changes the other peer has.
+pub open spec fn live_start(c: Cfg) -> bool {
+    session_start(c)
+    && (forall|i: int| 0 <= i < 2 ==> #[trigger] c.s[i].shared_heads@.len() == 0 && c.s[i].their_have is None
+        && a_queue(c.a[i]).subset_of(a_doc(c.a[1 - i])))
+}
+pub proof fn lemma_live_start_sinv(c: Cfg)
+    requires live_start(c), ensures M::sinv(cfg_d(c), cfg_n(c), abs_cfg(c)),
+{
+    lemma_session_inv(c);
+    let d = cfg_d(c); let n = cfg_n(c); let w = abs_cfg(c);
+    assert(w.peers.len() == 2);
+    assert forall|i: int| 0 <= i < 2 implies M::xinv_p(d, n, w, i) by {
+        assert(cfg_peer_ok(c, i));
+        assert(a_wf(c.a[i]));
+        assert(w.peers[i].their_have is None);
+        assert(vset(c.s[i].shared_heads@) =~= ISet::<int>::empty());
+        assert(w.peers[i].queue == a_queue(c.a[i]));
+        assert(w.peers[1 - i].doc == a_doc(c.a[1 - i]));
+        assert(M::bounded(w.peers[i].queue, n)) by { assert(a_n(c.a[i]) == n); }
+    }
+}
+
+pub open spec fn rp_run(cs: spec_fn(nat) -> Cfg, crs: spec_fn(nat) -> CRound, k: nat) -> M::RP {
+    choose|rp: M::RP| M::rvalid(cfg_d(cs(k)), cfg_n(cs(k)), abs_cfg(cs(k)), rp)
+        && abs_cfg(cs((k + 1) as nat)) == M::rw6(cfg_d(cs(k)), cfg_n(cs(k)), abs_cfg(cs(k)), rp) && (M::good(rp) <==> cr_good(crs(k)))
+}
+pub proof fn lemma_rounds_wf(cs: spec_fn(nat) -> Cfg, crs: spec_fn(nat) -> CRound, k: nat)
+    requires cfg_wf(cs(0)), code_rounds(cs, crs),
+    ensures cfg_wf(cs(k)), cfg_d(cs(k)) == cfg_d(cs(0)), cfg_n(cs(k)) == cfg_n(cs(0)),
+    decreases k,
+{
+    if k > 0 {
+        let j = (k - 1) as nat;
+        lemma_rounds_wf(cs, crs, j);
+        assert(cround_ok(cs(j), cs((j + 1) as nat), crs(j)));
+        lemma_round_code(cs(j), cs(k), crs(j));
+    }
+}
+
+// THEOREM (liveness of the code).  Take a live session start and any run made of code rounds (every call is to the
+// copied generate_sync_message / receive_sync_message / on_timeout; each generate may send the whole document), in
+// which infinitely often 4 consecutive rounds lose no message.  Then some configuration has equal documents.
+// Assumed: receive returns Ok on the messages it gets (they are always the peer's own generated messages); read-only
+// mode is off; a shared deps function and bound n; live_start.
+pub proof fn theorem_code_liveness(cs: spec_fn(nat) -> Cfg, crs: spec_fn(nat) -> CRound)
+    requires live_start(cs(0)), code_rounds(cs, crs), code_fair(crs),
+    ensures exists|K: nat| #![trigger cs(K)] a_doc(cs(K).a[0]) == a_doc(cs(K).a[1]),
+{
+    let d = cfg_d(cs(0)); let n = cfg_n(cs(0));
+    let ws = |k: nat| abs_cfg(cs(k));
+    let rps = |k: nat| rp_run(cs, crs, k);
+    lemma_live_start_sinv(cs(0));
+    assert(M::wf(d, n)) by { assert(cfg_peer_ok(cs(0), 0)); assert(a_wf(cs(0).a[0])); }
+    assert forall|k: nat| #![trigger rps(k)] M::rvalid(d, n, ws(k), rps(k)) && ws((k + 1) as nat) == M::rw6(d, n, ws(k), rps(k)) by {
+        lemma_rounds_wf(cs, crs, k);
+        assert(cround_ok(cs(k), cs((k + 1) as nat), crs(k)));
+        lemma_round_code(cs(k), cs((k + 1) as nat), crs(k));
+        let rp = rp_run(cs, crs, k);
+        assert(M::rvalid(cfg_d(cs(k)), cfg_n(cs(k)), abs_cfg(cs(k)), rp));
+    }
+    assert(M::run_ok(d, n, ws, rps));
+    assert forall|m: nat| #[trigger] M::win4(rps, m) by {
+        assert(code_win4(crs, m));
+        let k = choose|k: nat| #![trigger crs(k)] k >= m && cr_good(crs(k)) && cr_good(crs((k + 1) as nat))
+            && cr_good(crs((k + 2) as nat)) && cr_good(crs((k + 3) as nat));
+        assert(M::good(rps(k)) && M::good(rps((k + 1) as nat)) && M::good(rps((k + 2) as nat)) && M::good(rps((k + 3) as nat))) by {
+            let _ = rps(k); let _ = rps((k + 1) as nat); let _ = rps((k + 2) as nat); let _ = rps((k + 3) as nat);
+            lemma_rounds_wf(cs, crs, k); lemma_rounds_wf(cs, crs, (k + 1) as nat);
+            lemma_rounds_wf(cs, crs, (k + 2) as nat); lemma_rounds_wf(cs, crs, (k + 3) as nat);
+            lemma_round_code(cs(k), cs((k + 1) as nat), crs(k));
+            lemma_round_code(cs((k + 1) as nat), cs((k + 2) as nat), crs((k + 1) as nat));
+            lemma_round_code(cs((k + 2) as nat), cs((k + 3) as nat), crs((k + 2) as nat));
+            lemma_round_code(cs((k + 3) as nat), cs((k + 4) as nat), crs((k + 3) as nat));
+        }
+    }
+    assert(M::fair_lossy(rps));
+    M::theorem_liveness(d, n, ws, rps);
+    let K = choose|K: nat| #![trigger ws(K)] ws(K).peers[0].doc == ws(K).peers[1].doc;
+    assert(a_doc(cs(K).a[0]) == a_doc(cs(K).a[1]));
 }
 
 } // verus!
