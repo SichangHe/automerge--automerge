@@ -2335,4 +2335,238 @@ pub proof fn theorem_no_liveness_per_action_fairness()
         if k >= 8 { let j = ((k - 8) % 7) as nat; assert(j < 7); assert(sts(k) == cst(j)); }
     }
 }
+
+// =====================================================================================
+// Part 13 (vlm47_amcode edits): LIVENESS WITH LOCAL EDITS DURING THE RUN.  A block is a lock-step round or ONE
+// arbitrary model step, now INCLUDING Edit.  Docs only grow and every change is < n, so a run has at most 2n Edit
+// blocks (each Edit adds a change to the editor's doc): there is a last Edit.  After it Part 10's argument applies.
+// =====================================================================================
+pub open spec fn eblk_ok(d: Deps, n: int, w: World, isr: bool, rp: RP, st: Step, w2: World) -> bool {
+    if isr { rvalid(d, n, w, rp) && w2 == rw6(d, n, w, rp) } else { next(d, n, w, st, w2) }
+}
+pub open spec fn egrun_ok(d: Deps, n: int, ws: spec_fn(nat) -> World, isr: spec_fn(nat) -> bool, rps: spec_fn(nat) -> RP, sts: spec_fn(nat) -> Step) -> bool {
+    forall|k: nat| #![trigger rps(k)] eblk_ok(d, n, ws(k), isr(k), rps(k), sts(k), ws((k + 1) as nat))
+}
+pub open spec fn edit_at(isr: spec_fn(nat) -> bool, sts: spec_fn(nat) -> Step, k: nat) -> bool {
+    !isr(k) && sts(k) is Edit
+}
+pub open spec fn no_edit_from(isr: spec_fn(nat) -> bool, sts: spec_fn(nat) -> Step, E: nat) -> bool {
+    forall|k: nat| k >= E ==> !(#[trigger] edit_at(isr, sts, k))
+}
+pub open spec fn eq_from(ws: spec_fn(nat) -> World, K: nat) -> bool {
+    forall|j: nat| j >= K ==> (#[trigger] ws(j)).peers[0].doc == ws(j).peers[1].doc
+}
+pub open spec fn compl(s: ISet<int>) -> ISet<int> { ISet::new(|x: int| !s.contains(x)) }
+// number of changes < n not yet in either document
+pub open spec fn eroom(n: int, w: World) -> nat {
+    cnt(compl(w.peers[0].doc), n as nat) + cnt(compl(w.peers[1].doc), n as nat)
+}
+proof fn cnt_strict(s: ISet<int>, t: ISet<int>, k: nat, x: int)
+    requires s.subset_of(t), 0 <= x < k, t.contains(x), !s.contains(x), ensures cnt(s, k) < cnt(t, k), decreases k,
+{
+    cnt_mono(s, t, (k - 1) as nat);
+    if x < k - 1 { cnt_strict(s, t, (k - 1) as nat, x); }
+}
+proof fn lemma_eroom_le(n: int, w: World, w2: World)
+    requires n >= 0, w.peers.len() == 2, w2.peers.len() == 2,
+        w.peers[0].doc.subset_of(w2.peers[0].doc), w.peers[1].doc.subset_of(w2.peers[1].doc),
+    ensures eroom(n, w2) <= eroom(n, w),
+{
+    cnt_mono(compl(w2.peers[0].doc), compl(w.peers[0].doc), n as nat);
+    cnt_mono(compl(w2.peers[1].doc), compl(w.peers[1].doc), n as nat);
+}
+proof fn lemma_eblk(d: Deps, n: int, w: World, isr: bool, rp: RP, st: Step, w2: World)
+    requires wf(d, n), sinv(d, n, w), eblk_ok(d, n, w, isr, rp, st, w2),
+    ensures sinv(d, n, w2), eroom(n, w2) <= eroom(n, w),
+        (!isr && st is Edit) ==> eroom(n, w2) < eroom(n, w),
+{
+    assert(w.peers.len() == 2);
+    if isr { lemma_round(d, n, w, rp); lemma_eroom_le(n, w, w2); }
+    else {
+        lemma_step(d, n, w, st, w2); lemma_xstep(d, n, w, st, w2);
+        assert(w2.peers.len() == 2);
+        match st {
+            Step::Edit { who, c } => {
+                let p = w.peers[who];
+                assert(w2.peers == w.peers.update(who, Peer { doc: p.doc.insert(c), ..p }));
+                assert forall|i: int| 0 <= i < 2 implies w.peers[i].doc.subset_of(w2.peers[i].doc) by {
+                    assert(w2.peers[i] == if i == who { Peer { doc: p.doc.insert(c), ..p } } else { w.peers[i] });
+                }
+                lemma_eroom_le(n, w, w2);
+                assert(who == 0 || who == 1);
+                assert(compl(w2.peers[who].doc).subset_of(compl(w.peers[who].doc)));
+                assert(compl(w.peers[who].doc).contains(c) && !compl(w2.peers[who].doc).contains(c));
+                cnt_strict(compl(w2.peers[who].doc), compl(w.peers[who].doc), n as nat, c);
+                cnt_mono(compl(w2.peers[1 - who].doc), compl(w.peers[1 - who].doc), n as nat);
+            }
+            _ => {
+                lemma_rel_step(d, n, w, st, w2);
+                lemma_eroom_le(n, w, w2);
+            }
+        }
+    }
+}
+proof fn lemma_e_sinv(d: Deps, n: int, ws: spec_fn(nat) -> World, isr: spec_fn(nat) -> bool, rps: spec_fn(nat) -> RP, sts: spec_fn(nat) -> Step, k: nat)
+    requires wf(d, n), sinv(d, n, ws(0)), egrun_ok(d, n, ws, isr, rps, sts), ensures sinv(d, n, ws(k)), decreases k,
+{
+    if k > 0 {
+        let j = (k - 1) as nat;
+        lemma_e_sinv(d, n, ws, isr, rps, sts, j);
+        let _ = rps(j);
+        lemma_eblk(d, n, ws(j), isr(j), rps(j), sts(j), ws(k));
+    }
+}
+proof fn lemma_e_room(d: Deps, n: int, ws: spec_fn(nat) -> World, isr: spec_fn(nat) -> bool, rps: spec_fn(nat) -> RP, sts: spec_fn(nat) -> Step, i: nat, j: nat)
+    requires wf(d, n), sinv(d, n, ws(0)), egrun_ok(d, n, ws, isr, rps, sts), i <= j, ensures eroom(n, ws(j)) <= eroom(n, ws(i)), decreases j - i,
+{
+    if i < j {
+        let p = (j - 1) as nat;
+        lemma_e_room(d, n, ws, isr, rps, sts, i, p);
+        lemma_e_sinv(d, n, ws, isr, rps, sts, p);
+        let _ = rps(p);
+        lemma_eblk(d, n, ws(p), isr(p), rps(p), sts(p), ws(j));
+    }
+}
+// There is a last Edit block.
+proof fn lemma_last_edit(d: Deps, n: int, ws: spec_fn(nat) -> World, isr: spec_fn(nat) -> bool, rps: spec_fn(nat) -> RP, sts: spec_fn(nat) -> Step, v: nat, m: nat)
+    requires wf(d, n), sinv(d, n, ws(0)), egrun_ok(d, n, ws, isr, rps, sts), eroom(n, ws(m)) <= v,
+    ensures exists|E: nat| E >= m && #[trigger] no_edit_from(isr, sts, E),
+    decreases v,
+{
+    if exists|k: nat| k >= m && #[trigger] edit_at(isr, sts, k) {
+        let k = choose|k: nat| k >= m && #[trigger] edit_at(isr, sts, k);
+        lemma_e_room(d, n, ws, isr, rps, sts, m, k);
+        lemma_e_sinv(d, n, ws, isr, rps, sts, k);
+        let _ = rps(k);
+        lemma_eblk(d, n, ws(k), isr(k), rps(k), sts(k), ws((k + 1) as nat));
+        assert(eroom(n, ws((k + 1) as nat)) < eroom(n, ws(k)));
+        assert(v >= 1 && eroom(n, ws((k + 1) as nat)) <= (v - 1) as nat);
+        lemma_last_edit(d, n, ws, isr, rps, sts, (v - 1) as nat, (k + 1) as nat);
+    } else {
+        assert(no_edit_from(isr, sts, m)) by {
+            assert forall|k: nat| k >= m implies !(#[trigger] edit_at(isr, sts, k)) by {}
+        }
+    }
+}
+pub open spec fn shw(ws: spec_fn(nat) -> World, E: nat) -> spec_fn(nat) -> World { |k: nat| ws((E + k) as nat) }
+pub open spec fn shb(f: spec_fn(nat) -> bool, E: nat) -> spec_fn(nat) -> bool { |k: nat| f((E + k) as nat) }
+pub open spec fn shr(f: spec_fn(nat) -> RP, E: nat) -> spec_fn(nat) -> RP { |k: nat| f((E + k) as nat) }
+pub open spec fn shs(f: spec_fn(nat) -> Step, E: nat) -> spec_fn(nat) -> Step { |k: nat| f((E + k) as nat) }
+proof fn lemma_shift(d: Deps, n: int, ws: spec_fn(nat) -> World, isr: spec_fn(nat) -> bool, rps: spec_fn(nat) -> RP, sts: spec_fn(nat) -> Step, E: nat)
+    requires egrun_ok(d, n, ws, isr, rps, sts), no_edit_from(isr, sts, E), gfair(isr, rps),
+    ensures grun_ok(d, n, shw(ws, E), shb(isr, E), shr(rps, E), shs(sts, E)), gfair(shb(isr, E), shr(rps, E)),
+        forall|k: nat| #[trigger] shw(ws, E)(k) == ws((E + k) as nat),
+{
+    let ws2 = shw(ws, E); let isr2 = shb(isr, E); let rps2 = shr(rps, E); let sts2 = shs(sts, E);
+    assert forall|k: nat| #![trigger rps2(k)] blk_ok(d, n, ws2(k), isr2(k), rps2(k), sts2(k), ws2((k + 1) as nat)) by {
+        let e = (E + k) as nat;
+        let _ = rps(e);
+        assert(eblk_ok(d, n, ws(e), isr(e), rps(e), sts(e), ws((e + 1) as nat)));
+        assert(!edit_at(isr, sts, e));
+        assert(ws2((k + 1) as nat) == ws((e + 1) as nat));
+        assert(rps2(k) == rps(e) && isr2(k) == isr(e) && sts2(k) == sts(e) && ws2(k) == ws(e));
+        if !isr(e) { assert(!(sts(e) is Edit)); assert(passive_step(sts(e))); }
+    }
+    assert forall|m: nat| #[trigger] gwin4(isr2, rps2, m) by {
+        let m2 = (E + m) as nat;
+        assert(gwin4(isr, rps, m2));
+        let k = choose|k: nat| #![trigger rps(k)] k >= m2 && gr(isr, rps, k) && gr(isr, rps, (k + 1) as nat)
+            && gr(isr, rps, (k + 2) as nat) && gr(isr, rps, (k + 3) as nat);
+        let k2 = (k - E) as nat;
+        assert((E + k2) as nat == k);
+        assert(rps2(k2) == rps(k) && isr2(k2) == isr(k));
+        assert(rps2((k2 + 1) as nat) == rps((k + 1) as nat) && isr2((k2 + 1) as nat) == isr((k + 1) as nat));
+        assert(rps2((k2 + 2) as nat) == rps((k + 2) as nat) && isr2((k2 + 2) as nat) == isr((k + 2) as nat));
+        assert(rps2((k2 + 3) as nat) == rps((k + 3) as nat) && isr2((k2 + 3) as nat) == isr((k + 3) as nat));
+        assert(gr(isr2, rps2, k2) && gr(isr2, rps2, (k2 + 1) as nat) && gr(isr2, rps2, (k2 + 2) as nat) && gr(isr2, rps2, (k2 + 3) as nat));
+    }
+}
+// THEOREM (liveness with edits).  Any run of blocks (rounds or single model steps, Edit included, in any number
+// and at any time) in which infinitely often 4 consecutive blocks are loss-free rounds: there is K such that from K on
+// the two documents are equal (after the last Edit they converge and stay converged).
+pub proof fn theorem_edits_liveness(d: Deps, n: int, w: World, k0: nat, ws: spec_fn(nat) -> World, isr: spec_fn(nat) -> bool, rps: spec_fn(nat) -> RP, sts: spec_fn(nat) -> Step)
+    requires wf(d, n), reachable(d, n, w, k0), ws(0) == w, egrun_ok(d, n, ws, isr, rps, sts), gfair(isr, rps),
+    ensures exists|K: nat| #[trigger] eq_from(ws, K),
+{
+    theorem_sinv_reachable(d, n, w, k0);
+    theorem_edits_liveness_sinv(d, n, ws, isr, rps, sts);
+}
+// same, from any start world satisfying the invariant (used by the code-level theorem)
+pub proof fn theorem_edits_liveness_sinv(d: Deps, n: int, ws: spec_fn(nat) -> World, isr: spec_fn(nat) -> bool, rps: spec_fn(nat) -> RP, sts: spec_fn(nat) -> Step)
+    requires wf(d, n), sinv(d, n, ws(0)), egrun_ok(d, n, ws, isr, rps, sts), gfair(isr, rps),
+    ensures exists|K: nat| #[trigger] eq_from(ws, K),
+{
+    lemma_last_edit(d, n, ws, isr, rps, sts, eroom(n, ws(0)), 0);
+    let E = choose|E: nat| E >= 0 && #[trigger] no_edit_from(isr, sts, E);
+    lemma_e_sinv(d, n, ws, isr, rps, sts, E);
+    lemma_shift(d, n, ws, isr, rps, sts, E);
+    let ws2 = shw(ws, E); let isr2 = shb(isr, E); let rps2 = shr(rps, E); let sts2 = shs(sts, E);
+    assert(ws2(0) == ws(E));
+    assert(sinv(d, n, ws2(0)));
+    lemma_glive_from(d, n, ws2, isr2, rps2, sts2, phi(n, ws2(0)), 0);
+    let K2 = choose|K: nat| #![trigger ws2(K)] K >= 0 && ws2(K).peers[0].doc == ws2(K).peers[1].doc;
+    let K = (E + K2) as nat;
+    assert(eq_from(ws, K)) by {
+      assert forall|j: nat| j >= K implies (#[trigger] ws(j)).peers[0].doc == ws(j).peers[1].doc by {
+        let j2 = (j - E) as nat;
+        assert(ws2(j2) == ws(j));
+        theorem_gstays_equal(d, n, ws2, isr2, rps2, sts2, K2, j2);
+      }
+    }
+    assert(ws2(K2) == ws(K));
+}
+// COROLLARY (every edit is eventually received): a change in one document at time k is in both documents from some time on.
+pub proof fn corollary_edit_delivered(d: Deps, n: int, w: World, k0: nat, ws: spec_fn(nat) -> World, isr: spec_fn(nat) -> bool, rps: spec_fn(nat) -> RP, sts: spec_fn(nat) -> Step, k: nat, i: int, c: int)
+    requires wf(d, n), reachable(d, n, w, k0), ws(0) == w, egrun_ok(d, n, ws, isr, rps, sts), gfair(isr, rps),
+        i == 0 || i == 1, ws(k).peers.len() == 2, ws(k).peers[i].doc.contains(c),
+    ensures exists|K: nat| #![trigger ws(K)] K >= k && forall|j: nat| j >= K ==> (#[trigger] ws(j)).peers[1 - i].doc.contains(c),
+{
+    theorem_edits_liveness(d, n, w, k0, ws, isr, rps, sts);
+    let K = choose|K: nat| #[trigger] eq_from(ws, K);
+    theorem_sinv_reachable(d, n, w, k0);
+    lemma_e_sinv(d, n, ws, isr, rps, sts, k);
+    let K3 = if K >= k { K } else { k };
+    // docs only grow along the run
+    lemma_e_grow(d, n, ws, isr, rps, sts, k, K3);
+    assert forall|j: nat| j >= K3 implies (#[trigger] ws(j)).peers[1 - i].doc.contains(c) by {
+        assert(j >= K);
+        assert(ws(j).peers[0].doc == ws(j).peers[1].doc);
+        lemma_e_grow(d, n, ws, isr, rps, sts, k, j);
+    }
+}
+// docs only grow (each block)
+proof fn lemma_e_grow(d: Deps, n: int, ws: spec_fn(nat) -> World, isr: spec_fn(nat) -> bool, rps: spec_fn(nat) -> RP, sts: spec_fn(nat) -> Step, i: nat, j: nat)
+    requires wf(d, n), sinv(d, n, ws(0)), egrun_ok(d, n, ws, isr, rps, sts), i <= j,
+    ensures ws(i).peers.len() == 2, ws(j).peers.len() == 2,
+        forall|x: int, a: int| (a == 0 || a == 1) && ws(i).peers[a].doc.contains(x) ==> #[trigger] ws(j).peers[a].doc.contains(x),
+    decreases j - i,
+{
+    lemma_e_sinv(d, n, ws, isr, rps, sts, i);
+    lemma_e_sinv(d, n, ws, isr, rps, sts, j);
+    if i < j {
+        let p = (j - 1) as nat;
+        lemma_e_grow(d, n, ws, isr, rps, sts, i, p);
+        lemma_e_sinv(d, n, ws, isr, rps, sts, p);
+        let _ = rps(p);
+        lemma_eblk(d, n, ws(p), isr(p), rps(p), sts(p), ws(j));
+        lemma_e_step_grow(d, n, ws(p), isr(p), rps(p), sts(p), ws(j));
+    }
+}
+proof fn lemma_e_step_grow(d: Deps, n: int, w: World, isr: bool, rp: RP, st: Step, w2: World)
+    requires wf(d, n), sinv(d, n, w), eblk_ok(d, n, w, isr, rp, st, w2),
+    ensures w2.peers.len() == 2, forall|x: int, a: int| (a == 0 || a == 1) && w.peers[a].doc.contains(x) ==> #[trigger] w2.peers[a].doc.contains(x),
+{
+    assert(w.peers.len() == 2);
+    if isr { lemma_round(d, n, w, rp); assert(rel_i(w, w2, 0) && rel_i(w, w2, 1)); }
+    else {
+        lemma_step(d, n, w, st, w2);
+        match st {
+            Step::Edit { who, c } => {
+                let p = w.peers[who];
+                assert(w2.peers == w.peers.update(who, Peer { doc: p.doc.insert(c), ..p }));
+            }
+            _ => { lemma_xstep(d, n, w, st, w2); lemma_rel_step(d, n, w, st, w2); }
+        }
+    }
+}
 }
