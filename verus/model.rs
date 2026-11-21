@@ -1855,4 +1855,484 @@ pub proof fn lemma_block_exists(d: Deps, n: int, w: World, st: Step)
     requires guard(d, n, w, st), passive_step(st),
     ensures blk_ok(d, n, w, false, arbitrary(), st, apply(d, n, w, st)),
 {}
+
+// =====================================================================================
+// Part 11 (vlm47_amcode#7, sched): the general liveness theorem from any `sinv` world (not only model-reachable ones),
+// so that code runs, whose start is given by `sinv`, can use it.  Additive; uses the private lemma above.
+// =====================================================================================
+pub proof fn theorem_gliveness_sinv(d: Deps, n: int, ws: spec_fn(nat) -> World, isr: spec_fn(nat) -> bool, rps: spec_fn(nat) -> RP, sts: spec_fn(nat) -> Step)
+    requires wf(d, n), sinv(d, n, ws(0)), grun_ok(d, n, ws, isr, rps, sts), gfair(isr, rps),
+    ensures exists|K: nat| #![trigger ws(K)] ws(K).peers[0].doc == ws(K).peers[1].doc,
+{
+    lemma_glive_from(d, n, ws, isr, rps, sts, phi(n, ws(0)), 0);
+}
+
+// =====================================================================================
+// Part 12 (vlm47_amcode#7, sched): a COUNTEREXAMPLE LASSO to liveness under per-action fairness without lock-step.
+// Deps: none (n = 1, one change 0).  Peer A (index 0) has change 0; peer B (index 1) has nothing.
+// Schedule: finite prefix (Edit, then 7 steps) and then a 7-step cycle forever.  The cycle contains, with no Drop:
+// Timeout of each peer, Gen of each peer, and a (keep = true) Recv of EVERY message in the network.
+// Yet B never gets change 0: in every cycle A's last Recv is the STALE message R0 (B's first message, whose
+// Bloom filter claims "B has 0", a false positive the model allows), so A believes B needs nothing.
+// =====================================================================================
+pub open spec fn dz() -> Deps { |c: int| ISet::<int>::empty() }
+pub open spec fn zs() -> ISet<int> { ISet::<int>::empty() }
+pub open spec fn os() -> ISet<int> { ISet::<int>::empty().insert(0int) }
+pub open spec fn hv0() -> Have { Have { last_sync: zs(), bloom: zs() } }
+pub open spec fn hv1() -> Have { Have { last_sync: zs(), bloom: os() } }
+pub open spec fn m_a() -> Msg { Msg { heads: os(), need: zs(), have: seq![hv1()], changes: zs() } }
+pub open spec fn m_r0() -> Msg { Msg { heads: zs(), need: zs(), have: seq![hv1()], changes: zs() } }
+pub open spec fn m_r1() -> Msg { Msg { heads: zs(), need: os(), have: seq![hv0()], changes: zs() } }
+pub open spec fn mk(doc: ISet<int>, lsh: ISet<int>, th: Option<ISet<int>>, thave: Option<Seq<Have>>, tneed: Option<ISet<int>>, infl: bool, resp: bool) -> Peer {
+    Peer { doc: doc, queue: zs(), shared_heads: zs(), last_sent_heads: lsh, their_heads: th, their_have: thave, their_need: tneed,
+           sent_hashes: zs(), in_flight: infl, have_responded: resp, needs_reset: false }
+}
+pub open spec fn net0() -> Seq<ISet<Msg>> {
+    seq![ISet::<Msg>::empty().insert(m_a()), ISet::<Msg>::empty().insert(m_r0()).insert(m_r1())]
+}
+pub open spec fn pa_init() -> Peer { Peer { doc: os(), ..init_peer() } }
+pub open spec fn pa2() -> Peer { mk(os(), os(), Some(zs()), Some(seq![hv1()]), Some(zs()), true, true) }
+pub open spec fn pa4() -> Peer { mk(os(), zs(), Some(zs()), Some(seq![hv0()]), Some(os()), false, true) }
+pub open spec fn pa0() -> Peer { mk(os(), zs(), Some(zs()), Some(seq![hv1()]), Some(zs()), false, true) }
+pub open spec fn pb0() -> Peer { mk(zs(), zs(), Some(os()), Some(seq![hv1()]), Some(zs()), false, true) }
+pub open spec fn pb3() -> Peer { mk(zs(), zs(), Some(os()), Some(seq![hv1()]), Some(zs()), true, true) }
+pub open spec fn w2(a: Peer, b: Peer, na: ISet<Msg>, nb: ISet<Msg>) -> World { World { peers: seq![a, b], net: seq![na, nb] } }
+pub open spec fn nmt() -> ISet<Msg> { ISet::<Msg>::empty() }
+// prefix worlds 0..7
+pub open spec fn pw(k: nat) -> World {
+    if k == 0 { w2(init_peer(), init_peer(), nmt(), nmt()) }
+    else if k == 1 { w2(pa_init(), init_peer(), nmt(), nmt()) }
+    else if k == 2 { w2(pa_init(), mk(zs(), zs(), None, Some(Seq::empty()), None, true, true), nmt(), nmt().insert(m_r0())) }
+    else if k == 3 { w2(mk(os(), os(), None, Some(Seq::empty()), None, true, true), mk(zs(), zs(), None, Some(Seq::empty()), None, true, true), nmt().insert(m_a()), nmt().insert(m_r0())) }
+    else if k == 4 { w2(mk(os(), os(), None, Some(Seq::empty()), None, true, true), mk(zs(), zs(), Some(os()), Some(seq![hv1()]), Some(zs()), false, true), nmt().insert(m_a()), nmt().insert(m_r0())) }
+    else if k == 5 { w2(mk(os(), os(), None, Some(Seq::empty()), None, true, true), pb3(), nmt().insert(m_a()), nmt().insert(m_r0()).insert(m_r1())) }
+    else if k == 6 { w2(pa4(), pb3(), nmt().insert(m_a()), nmt().insert(m_r0()).insert(m_r1())) }
+    else { w2(pa0(), pb3(), nmt().insert(m_a()), nmt().insert(m_r0()).insert(m_r1())) }
+}
+pub open spec fn pst(k: nat) -> Step {
+    if k == 0 { Step::Edit { who: 0, c: 0 } }
+    else if k == 1 { Step::Gen { who: 1, bloom: os(), fake: false } }
+    else if k == 2 { Step::Gen { who: 0, bloom: os(), fake: false } }
+    else if k == 3 { Step::Recv { who: 1, m: m_a(), s2: zs(), keep: true } }
+    else if k == 4 { Step::Gen { who: 1, bloom: zs(), fake: false } }
+    else if k == 5 { Step::Recv { who: 0, m: m_r1(), s2: os(), keep: true } }
+    else if k == 6 { Step::Recv { who: 0, m: m_r0(), s2: os(), keep: true } }
+    else { Step::Timeout { who: 1 } }
+}
+// cycle worlds j = 0..6 (world before cycle step j)
+pub open spec fn cw(j: nat) -> World {
+    if j == 0 { w2(pa0(), pb0(), net0()[0], net0()[1]) }
+    else if j == 1 || j == 2 { w2(pa2(), pb0(), net0()[0], net0()[1]) }
+    else if j == 3 { w2(pa2(), pb3(), net0()[0], net0()[1]) }
+    else if j == 4 { w2(pa4(), pb3(), net0()[0], net0()[1]) }
+    else { w2(pa0(), pb3(), net0()[0], net0()[1]) }
+}
+pub open spec fn cst(j: nat) -> Step {
+    if j == 0 { Step::Gen { who: 0, bloom: os(), fake: false } }
+    else if j == 1 { Step::Recv { who: 1, m: m_a(), s2: zs(), keep: true } }
+    else if j == 2 { Step::Gen { who: 1, bloom: zs(), fake: false } }
+    else if j == 3 { Step::Recv { who: 0, m: m_r1(), s2: os(), keep: true } }
+    else if j == 4 { Step::Recv { who: 0, m: m_r0(), s2: os(), keep: true } }
+    else if j == 5 { Step::Timeout { who: 0 } }
+    else { Step::Timeout { who: 1 } }
+}
+pub open spec fn lw(k: nat) -> World { if k < 8 { pw(k) } else { cw(((k - 8) % 7) as nat) } }
+pub open spec fn lst(k: nat) -> Step { if k < 8 { pst(k) } else { cst(((k - 8) % 7) as nat) } }
+
+// --- facts about the empty dependency function ---
+proof fn dz_heads(s: ISet<int>) ensures heads(dz(), s) =~= s {}
+proof fn dz_closure(h: ISet<int>) ensures closure(dz(), 1, h) =~= h {
+    reveal_with_fuel(reach, 2);
+}
+proof fn dz_missing(s: ISet<int>, q: ISet<int>, st: ISet<int>) ensures missing(dz(), 1, s, q, st) =~= st.difference(s).difference(q) {
+    reveal_with_fuel(walk, 2);
+}
+proof fn dz_wf() ensures wf(dz(), 1) {}
+
+proof fn peer_ext(p: Peer, q: Peer)
+    requires p.doc == q.doc, p.queue == q.queue, p.shared_heads == q.shared_heads, p.last_sent_heads == q.last_sent_heads,
+        p.their_heads == q.their_heads, p.their_have == q.their_have, p.their_need == q.their_need, p.sent_hashes == q.sent_hashes,
+        p.in_flight == q.in_flight, p.have_responded == q.have_responded, p.needs_reset == q.needs_reset,
+    ensures p == q {}
+// no-op sets
+proof fn ins_same(s: ISet<Msg>, m: Msg) requires s.contains(m), ensures s.insert(m) == s { assert(s.insert(m) =~= s); }
+proof fn net0_has() ensures net0()[0].contains(m_a()), net0()[1].contains(m_r0()), net0()[1].contains(m_r1()) {}
+
+// A (doc {0}) facing a Have whose Bloom contains 0 and empty need sends nothing.
+proof fn lemma_hts_zero(p: Peer)
+    requires p.doc == os(), p.their_have == Some(seq![hv1()]), p.their_need == Some(zs()), p.sent_hashes == zs(),
+    ensures send_set(dz(), 1, p) =~= zs(),
+{
+    let have = seq![hv1()];
+    assert(have.len() == 1 && have[0] == hv1());
+    assert(all_last_sync(have) =~= zs()) by {
+        assert forall|x: int| !all_last_sync(have).contains(x) by {
+            if all_last_sync(have).contains(x) {
+                let i = choose|i: int| 0 <= i < 1 && #[trigger] have[i].last_sync.contains(x);
+                assert(have[i] == hv1());
+            }
+        }
+    }
+    dz_closure(all_last_sync(have));
+    let need2 = zs().intersect(p.doc);
+    assert(need2 =~= zs());
+    let hs = p.doc.difference(closure(dz(), 1, all_last_sync(have)));
+    let miss = ISet::new(|h: int| hs.contains(h) && forall|i: int| 0 <= i < have.len() ==> !(#[trigger] have[i].bloom.contains(h)));
+    assert(miss =~= zs()) by {
+        assert forall|h: int| !miss.contains(h) by {
+            if miss.contains(h) { assert(hs.contains(h)); assert(h == 0); assert(have[0].bloom.contains(h)); }
+        }
+    }
+    let sent = ISet::new(|h: int| hs.contains(h) && exists|m: int| miss.contains(m) && closure(dz(), 1, ISet::empty().insert(h)).contains(m));
+    assert(sent =~= zs());
+    assert(hashes_to_send(dz(), 1, p.doc, have, zs()) =~= zs());
+    assert(send_set(dz(), 1, p) =~= zs());
+}
+
+// A generates in the cycle: A0 -> A2 and the message m_a (already in the net)
+proof fn c0() ensures next(dz(), 1, cw(0), cst(0), cw(1)) {
+    dz_wf();
+    let p = pa0();
+    let o = os();
+    dz_heads(p.doc); dz_closure(p.shared_heads);
+    dz_missing(p.doc, p.queue, opt_set(p.their_heads));
+    let need = missing(dz(), 1, p.doc, p.queue, opt_set(p.their_heads));
+    assert(need =~= zs());
+    assert(all_last_sync(seq![hv1()]) =~= zs()) by {
+        assert forall|x: int| !all_last_sync(seq![hv1()]).contains(x) by {
+            if all_last_sync(seq![hv1()]).contains(x) {
+                let i = choose|i: int| 0 <= i < 1 && #[trigger] seq![hv1()][i].last_sync.contains(x);
+                assert(seq![hv1()][i] == hv1());
+            }
+        }
+    }
+    dz_closure(all_last_sync(seq![hv1()]));
+    let hs = p.doc.difference(closure(dz(), 1, all_last_sync(seq![hv1()])));
+    assert(hs =~= o);
+    lemma_hts_zero(p);
+    assert(send_set(dz(), 1, p) =~= zs());
+    assert(guard(dz(), 1, cw(0), cst(0)));
+    let r = gen(dz(), 1, p, o, false);
+    assert(os().contains(0int) && !zs().contains(0int));
+    assert(heads(dz(), p.doc) == os());
+    assert(!must_reset(p)) by { assert(seq![hv1()][0] == hv1()); assert(zs().subset_of(p.doc)); }
+    assert(zs().union(zs()) =~= zs());
+    assert(need == zs());
+    assert(zs().subset_of(opt_set(p.their_heads)));
+    assert(r.1 == Some(m_a()));
+    assert(r.0 == pa2()) by { peer_ext(r.0, pa2()); }
+    ins_same(net0()[0], m_a());
+    assert(apply(dz(), 1, cw(0), cst(0)) == cw(1)) by { assert(apply(dz(), 1, cw(0), cst(0)).net =~= cw(1).net); assert(apply(dz(), 1, cw(0), cst(0)).peers =~= cw(1).peers); }
+}
+
+proof fn world_ext(w: World, w2: World)
+    requires w.peers.len() == 2, w2.peers.len() == 2, w.net.len() == 2, w2.net.len() == 2,
+        w.peers[0] == w2.peers[0], w.peers[1] == w2.peers[1], w.net[0] == w2.net[0], w.net[1] == w2.net[1],
+    ensures w == w2
+{ assert(w.peers =~= w2.peers); assert(w.net =~= w2.net); }
+proof fn ins_ex(s: ISet<Msg>, m: Msg, t: ISet<Msg>) requires s.contains(m), t =~= s, ensures s.insert(m) == t { assert(s.insert(m) =~= t); }
+
+// ---- generic peer-level facts ----
+// B (doc {}, knows nothing of 0) receives A's message m_a
+proof fn lemma_recv_b(p: Peer)
+    requires p.doc == zs(), p.queue == zs(), p.shared_heads == zs(), p.last_sent_heads == zs(), p.sent_hashes == zs(),
+    ensures recv(dz(), 1, p, m_a(), zs()) == (Peer { in_flight: false, their_heads: Some(os()), their_have: Some(seq![hv1()]), their_need: Some(zs()), ..p })
+{
+    dz_heads(p.doc); dz_closure(zs()); dz_heads(zs());
+    let m = m_a();
+    assert(os().contains(0int) && !zs().contains(0int));
+    let q = recv(dz(), 1, p, m, zs());
+    assert(zs().union(zs()) =~= zs()); assert(zs().difference(zs()) =~= zs());
+    assert(os().intersect(zs()) =~= zs());
+    assert(heads(dz(), zs()) == zs());
+    assert(zs().union(zs()) == zs());
+    assert(p.sent_hashes.difference(closure(dz(), 1, zs())) =~= zs());
+    peer_ext(q, Peer { in_flight: false, their_heads: Some(os()), their_have: Some(seq![hv1()]), their_need: Some(zs()), ..p });
+}
+// A (doc {0}) receives a message with empty heads, no changes (R0 or R1): wipe
+proof fn lemma_recv_a(p: Peer, m: Msg)
+    requires p.doc == os(), p.queue == zs(), p.shared_heads == zs(), p.sent_hashes == zs(), m.heads == zs(), m.changes == zs(),
+    ensures recv(dz(), 1, p, m, os()) == (Peer { last_sent_heads: zs(), in_flight: false, their_heads: Some(zs()), their_have: Some(m.have), their_need: Some(m.need), ..p })
+{
+    dz_heads(p.doc); dz_heads(os()); dz_closure(zs());
+    assert(os().contains(0int) && !zs().contains(0int));
+    let q = recv(dz(), 1, p, m, os());
+    assert(os().union(zs()) =~= os()); assert(os().difference(os()) =~= zs());
+    assert(zs().intersect(os()) =~= zs());
+    assert(m.heads.intersect(os()) =~= m.heads);
+    assert(p.queue.union(m.changes).difference(os()) =~= zs());
+    assert(m.heads == ISet::<int>::empty());
+    assert(p.sent_hashes.difference(closure(dz(), 1, zs())) =~= zs());
+    peer_ext(q, Peer { last_sent_heads: zs(), in_flight: false, their_heads: Some(zs()), their_have: Some(m.have), their_need: Some(m.need), ..p });
+}
+// B generates its reply to A's heads
+proof fn lemma_gen_b(p: Peer)
+    requires p.doc == zs(), p.queue == zs(), p.shared_heads == zs(), p.last_sent_heads == zs(), p.sent_hashes == zs(), !p.needs_reset,
+        p.their_heads == Some(os()), p.their_have == Some(seq![hv1()]), p.their_need == Some(zs()), p.have_responded, !p.in_flight,
+    ensures gen(dz(), 1, p, zs(), false) == (Peer { in_flight: true, ..p }, Some(m_r1()))
+{
+    dz_heads(p.doc); dz_missing(p.doc, p.queue, opt_set(p.their_heads));
+    assert(os().contains(0int) && !zs().contains(0int));
+    let need = missing(dz(), 1, p.doc, p.queue, opt_set(p.their_heads));
+    assert(need =~= os());
+    let have = seq![hv1()];
+    assert(have.len() == 1 && have[0] == hv1());
+    assert(os().subset_of(opt_set(p.their_heads)));
+    assert(!must_reset(p));
+    // send set is empty (nothing to send: doc is empty)
+    assert(all_last_sync(have) =~= zs()) by {
+        assert forall|x: int| !all_last_sync(have).contains(x) by {
+            if all_last_sync(have).contains(x) { let i = choose|i: int| 0 <= i < 1 && #[trigger] have[i].last_sync.contains(x); assert(have[i] == hv1()); }
+        }
+    }
+    dz_closure(all_last_sync(have));
+    let hs = p.doc.difference(closure(dz(), 1, all_last_sync(have)));
+    assert(hs =~= zs());
+    let miss = ISet::new(|h: int| hs.contains(h) && forall|i: int| 0 <= i < have.len() ==> !(#[trigger] have[i].bloom.contains(h)));
+    assert(miss =~= zs());
+    let sent = ISet::new(|h: int| hs.contains(h) && exists|m: int| miss.contains(m) && closure(dz(), 1, ISet::empty().insert(h)).contains(m));
+    assert(sent =~= zs());
+    assert(zs().intersect(p.doc) =~= zs());
+    assert(hashes_to_send(dz(), 1, p.doc, have, zs()) =~= zs());
+    assert(send_set(dz(), 1, p) =~= zs());
+    assert(zs().union(zs()) =~= zs());
+    assert(heads(dz(), p.doc) == zs());
+    assert(Some(os()) != Some(zs())) by { assert(os() != zs()); }
+    let r = gen(dz(), 1, p, zs(), false);
+    peer_ext(r.0, Peer { in_flight: true, ..p });
+    assert(r.1 == Some(m_r1()));
+}
+
+// ---- Recv / Timeout / Edit / Gen at world level ----
+proof fn recv_guard(w: World, who: int, m: Msg, s2: ISet<int>)
+    requires w.peers.len() == 2, w.net.len() == 2, w.peers[who].queue == zs(), m.changes == zs(), s2 == w.peers[who].doc, who == 0 || who == 1, w.net[1 - who].contains(m),
+    ensures guard(dz(), 1, w, Step::Recv { who, m, s2, keep: true })
+{
+    assert(zs().union(zs()) =~= zs());
+    assert(w.peers[who].queue.union(m.changes) == zs());
+}
+// a world that is two peers and two nets
+proof fn w2_ok(a: Peer, b: Peer, na: ISet<Msg>, nb: ISet<Msg>) ensures w2(a, b, na, nb).peers.len() == 2, w2(a, b, na, nb).net.len() == 2 {}
+
+// Recv of keep = true: only the receiving peer changes
+proof fn recv_apply(w: World, who: int, m: Msg, s2: ISet<int>, w3: World)
+    requires w.peers.len() == 2, w.net.len() == 2, who == 0 || who == 1,
+        w3.peers.len() == 2, w3.net.len() == 2, w3.net == w.net,
+        w3.peers[who] == recv(dz(), 1, w.peers[who], m, s2), w3.peers[1 - who] == w.peers[1 - who],
+    ensures apply(dz(), 1, w, Step::Recv { who, m, s2, keep: true }) == w3
+{
+    let a = apply(dz(), 1, w, Step::Recv { who, m, s2, keep: true });
+    assert(a.peers.len() == 2 && a.net.len() == 2);
+    assert(a.peers =~= w3.peers); assert(a.net =~= w3.net);
+}
+
+proof fn lasso_prefix(k: nat)
+    requires k < 8,
+    ensures next(dz(), 1, pw(k), pst(k), if k + 1 < 8 { pw((k + 1) as nat) } else { cw(0) }),
+{
+    dz_wf();
+    assert(os().contains(0int) && !zs().contains(0int));
+    reveal_with_fuel(pw, 1);
+    let tgt = if k + 1 < 8 { pw((k + 1) as nat) } else { cw(0) };
+    if k == 0 {
+        let w = pw(0); let st = pst(0);
+        assert(guard(dz(), 1, w, st)) by { assert(zs().difference(zs()) =~= zs()); assert(forall|y: int| !w.peers[0].queue.contains(y)); }
+        let a = apply(dz(), 1, w, st);
+        assert(a.peers[0] == pa_init());
+        world_ext(a, tgt);
+    } else if k == 1 {
+        let w = pw(1); let st = pst(1);
+        gen_init_b();
+        assert(guard(dz(), 1, w, st));
+        let a = apply(dz(), 1, w, st);
+        world_ext(a, tgt);
+    } else if k == 2 {
+        let w = pw(2); let st = pst(2);
+        gen_init_a();
+        assert(guard(dz(), 1, w, st)) by { dz_closure(zs()); assert(os().difference(zs()) =~= os()); }
+        let a = apply(dz(), 1, w, st);
+        world_ext(a, tgt);
+    } else if k == 3 {
+        let w = pw(3); let st = pst(3);
+        recv_guard(w, 1, m_a(), zs());
+        lemma_recv_b(w.peers[1]);
+        assert(w.net[0].contains(m_a()));
+        recv_apply(w, 1, m_a(), zs(), tgt);
+    } else if k == 4 {
+        let w = pw(4); let st = pst(4);
+        lemma_gen_b(w.peers[1]);
+        assert(guard(dz(), 1, w, st)) by { dz_closure(zs()); assert(zs().difference(zs()) =~= zs()); }
+        let a = apply(dz(), 1, w, st);
+        world_ext(a, tgt);
+    } else if k == 5 {
+        let w = pw(5); let st = pst(5);
+        recv_guard(w, 0, m_r1(), os());
+        lemma_recv_a(w.peers[0], m_r1());
+        assert(w.net[1].contains(m_r1()));
+        recv_apply(w, 0, m_r1(), os(), tgt);
+    } else if k == 6 {
+        let w = pw(6); let st = pst(6);
+        recv_guard(w, 0, m_r0(), os());
+        lemma_recv_a(w.peers[0], m_r0());
+        assert(w.net[1].contains(m_r0()));
+        recv_apply(w, 0, m_r0(), os(), tgt);
+    } else {
+        let w = pw(7); let st = pst(7);
+        let a = apply(dz(), 1, w, st);
+        assert(zs().union(zs()) =~= zs());
+        peer_ext(tmo(pb3()), pb0());
+        world_ext(a, tgt);
+    }
+}
+proof fn gen_init_b() ensures gen(dz(), 1, init_peer(), os(), false) == (mk(zs(), zs(), None, Some(Seq::empty()), None, true, true), Some(m_r0())) {
+    let p = init_peer();
+    dz_heads(p.doc); dz_missing(p.doc, p.queue, opt_set(p.their_heads));
+    assert(zs().union(zs()) =~= zs());
+    assert(send_set(dz(), 1, p) == zs());
+    let r = gen(dz(), 1, p, os(), false);
+    assert(opt_set(p.their_heads) == zs());
+    assert(missing(dz(), 1, p.doc, p.queue, zs()) == zs()) by { assert(zs().difference(zs()).difference(zs()) =~= zs()); }
+    assert(!must_reset(p));
+    peer_ext(r.0, mk(zs(), zs(), None, Some(Seq::empty()), None, true, true));
+}
+proof fn gen_init_a() ensures gen(dz(), 1, pa_init(), os(), false) == (mk(os(), os(), None, Some(Seq::empty()), None, true, true), Some(m_a())) {
+    let p = pa_init();
+    dz_heads(p.doc); dz_missing(p.doc, p.queue, opt_set(p.their_heads));
+    assert(os().contains(0int) && !zs().contains(0int));
+    assert(zs().union(zs()) =~= zs());
+    assert(send_set(dz(), 1, p) == zs());
+    let r = gen(dz(), 1, p, os(), false);
+    assert(opt_set(p.their_heads) == zs());
+    assert(missing(dz(), 1, p.doc, p.queue, zs()) == zs()) by { assert(zs().difference(os()).difference(zs()) =~= zs()); }
+    assert(!must_reset(p));
+    assert(heads(dz(), p.doc) == os());
+    peer_ext(r.0, mk(os(), os(), None, Some(Seq::empty()), None, true, true));
+}
+
+proof fn lasso_cycle(j: nat)
+    requires j < 7,
+    ensures next(dz(), 1, cw(j), cst(j), cw(((j + 1) % 7) as nat)),
+{
+    dz_wf();
+    assert(os().contains(0int) && !zs().contains(0int));
+    net0_has();
+    let w = cw(j); let st = cst(j);
+    let tgt = cw(((j + 1) % 7) as nat);
+    if j == 0 { c0(); }
+    else if j == 1 {
+        recv_guard(w, 1, m_a(), zs());
+        lemma_recv_b(w.peers[1]);
+        recv_apply(w, 1, m_a(), zs(), tgt);
+    } else if j == 2 {
+        lemma_gen_b(w.peers[1]);
+        assert(guard(dz(), 1, w, st)) by { dz_closure(zs()); assert(zs().difference(zs()) =~= zs()); }
+        let a = apply(dz(), 1, w, st);
+        ins_same(net0()[1], m_r1());
+        world_ext(a, tgt);
+    } else if j == 3 {
+        recv_guard(w, 0, m_r1(), os());
+        lemma_recv_a(w.peers[0], m_r1());
+        recv_apply(w, 0, m_r1(), os(), tgt);
+    } else if j == 4 {
+        recv_guard(w, 0, m_r0(), os());
+        lemma_recv_a(w.peers[0], m_r0());
+        recv_apply(w, 0, m_r0(), os(), tgt);
+    } else if j == 5 {
+        let a = apply(dz(), 1, w, st);
+        assert(zs().union(zs()) =~= zs());
+        peer_ext(tmo(pa0()), pa0());
+        world_ext(a, tgt);
+    } else {
+        let a = apply(dz(), 1, w, st);
+        peer_ext(tmo(pb3()), pb0());
+        world_ext(a, tgt);
+    }
+}
+proof fn lasso_next(k: nat) ensures next(dz(), 1, lw(k), lst(k), lw((k + 1) as nat)) {
+    if k < 8 { lasso_prefix(k); } else {
+        let j = ((k - 8) % 7) as nat;
+        lasso_cycle(j);
+        assert(((k + 1 - 8) % 7) as nat == ((j + 1) % 7) as nat);
+    }
+}
+proof fn lasso_docs(k: nat) requires k >= 1, ensures lw(k).peers[0].doc == os(), lw(k).peers[1].doc == zs() {
+    if k < 8 { reveal_with_fuel(pw, 1); } else { let j = ((k - 8) % 7) as nat; assert(j < 7); }
+}
+// the network only ever holds the three messages
+proof fn lasso_net(k: nat) ensures forall|x: Msg| #[trigger] lw(k).net[0].contains(x) ==> x == m_a(),
+    forall|x: Msg| #[trigger] lw(k).net[1].contains(x) ==> x == m_r0() || x == m_r1(),
+{
+    if k < 8 { reveal_with_fuel(pw, 1); } else { let j = ((k - 8) % 7) as nat; assert(j < 7); net0_has(); }
+}
+// actions
+pub open spec fn is_recv(st: Step, who: int, m: Msg) -> bool { match st { Step::Recv { who: w, m: mm, .. } => w == who && mm == m, _ => false } }
+pub open spec fn is_gen(st: Step, who: int) -> bool { match st { Step::Gen { who: w, .. } => w == who, _ => false } }
+pub open spec fn is_tmo(st: Step, who: int) -> bool { match st { Step::Timeout { who: w } => w == who, _ => false } }
+pub open spec fn is_drop(st: Step) -> bool { match st { Step::Drop { .. } => true, _ => false } }
+pub open spec fn is_edit(st: Step) -> bool { match st { Step::Edit { .. } => true, _ => false } }
+pub open spec fn tmo_after(sts: spec_fn(nat) -> Step, who: int, m: nat) -> bool { exists|k: nat| #![trigger sts(k)] k >= m && is_tmo(sts(k), who) }
+pub open spec fn gen_after(sts: spec_fn(nat) -> Step, who: int, m: nat) -> bool { exists|k: nat| #![trigger sts(k)] k >= m && is_gen(sts(k), who) }
+pub open spec fn recv_after(sts: spec_fn(nat) -> Step, who: int, msg: Msg, m: nat) -> bool { exists|k: nat| #![trigger sts(k)] k >= m && is_recv(sts(k), who, msg) }
+pub open spec fn in_net_after(ws: spec_fn(nat) -> World, who: int, msg: Msg, m: nat) -> bool { exists|k: nat| #![trigger ws(k)] k >= m && ws(k).net[1 - who].contains(msg) }
+pub open spec fn inf_in_net(ws: spec_fn(nat) -> World, who: int, msg: Msg) -> bool { forall|m: nat| #[trigger] in_net_after(ws, who, msg, m) }
+pub open spec fn inf_recv(sts: spec_fn(nat) -> Step, who: int, msg: Msg) -> bool { forall|m: nat| #[trigger] recv_after(sts, who, msg, m) }
+// "per-action fairness" of an infinite schedule of model steps
+pub open spec fn per_action_fair(ws: spec_fn(nat) -> World, sts: spec_fn(nat) -> Step) -> bool {
+    // weak fairness of each peer's timeout and generate action
+    (forall|who: int, m: nat| (who == 0 || who == 1) ==> #[trigger] tmo_after(sts, who, m))
+    && (forall|who: int, m: nat| (who == 0 || who == 1) ==> #[trigger] gen_after(sts, who, m))
+    // a message that sits in the network infinitely often (so it was sent) is delivered infinitely often
+    && (forall|who: int, msg: Msg| (who == 0 || who == 1) && #[trigger] inf_in_net(ws, who, msg) ==> #[trigger] inf_recv(sts, who, msg))
+    // loss-free, and no edit after the first step
+    && (forall|k: nat| #![trigger sts(k)] !is_drop(sts(k)) && (k >= 1 ==> !is_edit(sts(k))))
+}
+// THEOREM (counterexample).  There is an infinite model schedule (a lasso) that is a legal run from `init`,
+// satisfies per-action fairness (even delivering every network message every cycle, no drops, no stale-only luck)
+// and in which the documents are never equal after the first edit.
+pub proof fn theorem_no_liveness_per_action_fairness()
+    ensures
+        wf(dz(), 1),
+        init(lw(0)),
+        forall|k: nat| #[trigger] next(dz(), 1, lw(k), lst(k), lw((k + 1) as nat)),
+        per_action_fair(|k: nat| lw(k), |k: nat| lst(k)),
+        forall|k: nat| k >= 1 ==> #[trigger] lw(k).peers[0].doc != lw(k).peers[1].doc,
+{
+    dz_wf();
+    assert(init(lw(0))) by { reveal_with_fuel(pw, 1); }
+    assert forall|k: nat| #[trigger] next(dz(), 1, lw(k), lst(k), lw((k + 1) as nat)) by { lasso_next(k); }
+    assert forall|k: nat| k >= 1 implies #[trigger] lw(k).peers[0].doc != lw(k).peers[1].doc by {
+        lasso_docs(k); assert(os().contains(0int) && !zs().contains(0int));
+    }
+    let ws = |k: nat| lw(k);
+    let sts = |k: nat| lst(k);
+    assert forall|who: int, m: nat| (who == 0 || who == 1) implies #[trigger] tmo_after(sts, who, m) by {
+        if who == 0 || who == 1 {
+            let k = (8 + 7 * m + 5 + who) as nat;
+            assert(sts(k) == cst(((k - 8) % 7) as nat));
+        }
+    }
+    assert forall|who: int, m: nat| (who == 0 || who == 1) implies #[trigger] gen_after(sts, who, m) by {
+        if who == 0 || who == 1 {
+            let k = (8 + 7 * m + 2 * who) as nat;
+            assert(sts(k) == cst(((k - 8) % 7) as nat));
+        }
+    }
+    assert forall|who: int, msg: Msg| (who == 0 || who == 1)
+        && #[trigger] inf_in_net(ws, who, msg)
+        implies #[trigger] inf_recv(sts, who, msg) by {
+        if (who == 0 || who == 1) && inf_in_net(ws, who, msg) {
+            assert(in_net_after(ws, who, msg, 0));
+            let k0 = choose|k: nat| #![trigger ws(k)] k >= 0 && ws(k).net[1 - who].contains(msg);
+            lasso_net(k0);
+            assert forall|m: nat| #[trigger] recv_after(sts, who, msg, m) by {
+                let off: nat = if who == 1 { 1 } else if msg == m_r1() { 3 } else { 4 };
+                let k = (8 + 7 * m + off) as nat;
+                assert(sts(k) == cst(((k - 8) % 7) as nat));
+            }
+        }
+    }
+    assert forall|k: nat| #![trigger sts(k)] !is_drop(sts(k)) && (k >= 1 ==> !is_edit(sts(k))) by {
+        if k >= 8 { let j = ((k - 8) % 7) as nat; assert(j < 7); assert(sts(k) == cst(j)); }
+    }
+}
 }
