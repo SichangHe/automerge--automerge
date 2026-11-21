@@ -1855,4 +1855,15 @@ pub proof fn lemma_block_exists(d: Deps, n: int, w: World, st: Step)
     requires guard(d, n, w, st), passive_step(st),
     ensures blk_ok(d, n, w, false, arbitrary(), st, apply(d, n, w, st)),
 {}
+
+// =====================================================================================
+// Part 11 (vlm47_amcode#7, sched): the general liveness theorem from any `sinv` world (not only model-reachable ones),
+// so that code runs, whose start is given by `sinv`, can use it.  Additive; uses the private lemma above.
+// =====================================================================================
+pub proof fn theorem_gliveness_sinv(d: Deps, n: int, ws: spec_fn(nat) -> World, isr: spec_fn(nat) -> bool, rps: spec_fn(nat) -> RP, sts: spec_fn(nat) -> Step)
+    requires wf(d, n), sinv(d, n, ws(0)), grun_ok(d, n, ws, isr, rps, sts), gfair(isr, rps),
+    ensures exists|K: nat| #![trigger ws(K)] ws(K).peers[0].doc == ws(K).peers[1].doc,
+{
+    lemma_glive_from(d, n, ws, isr, rps, sts, phi(n, ws(0)), 0);
+}
 }
