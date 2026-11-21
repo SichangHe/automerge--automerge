@@ -1572,4 +1572,127 @@ pub proof fn theorem_code_liveness(cs: spec_fn(nat) -> Cfg, crs: spec_fn(nat) ->
     assert(a_doc(cs(K).a[0]) == a_doc(cs(K).a[1]));
 }
 
+
+// =====================================================================================
+// Part F (vlm47_amcode edits): LIVENESS OF THE CODE WITH EDITS DURING THE RUN.  A block is a code round (Part E) or
+// ONE code step (`code_next`: generate, receive, timeout, drop, or a local edit `step_edit`), in any order and number.
+// Fairness counts only the round blocks: infinitely often, 4 consecutive blocks are loss-free rounds.
+// The local edit is still the trusted `edit_rel` (no code for it); everything else is the copied code.
+// =====================================================================================
+pub open spec fn code_blk(c: Cfg, c2: Cfg, isr: bool, cr: CRound) -> bool {
+    if isr { cround_ok(c, c2, cr) } else { code_next(c, c2) }
+}
+pub open spec fn code_blocks(cs: spec_fn(nat) -> Cfg, crs: spec_fn(nat) -> CRound, isr: spec_fn(nat) -> bool) -> bool {
+    forall|k: nat| #![trigger crs(k)] code_blk(cs(k), cs((k + 1) as nat), isr(k), crs(k))
+}
+pub open spec fn cgr(crs: spec_fn(nat) -> CRound, isr: spec_fn(nat) -> bool, k: nat) -> bool { isr(k) && cr_good(crs(k)) }
+pub open spec fn code_gwin4(crs: spec_fn(nat) -> CRound, isr: spec_fn(nat) -> bool, m: nat) -> bool {
+    exists|k: nat| #![trigger crs(k)] k >= m && cgr(crs, isr, k) && cgr(crs, isr, (k + 1) as nat)
+        && cgr(crs, isr, (k + 2) as nat) && cgr(crs, isr, (k + 3) as nat)
+}
+pub open spec fn code_gfair(crs: spec_fn(nat) -> CRound, isr: spec_fn(nat) -> bool) -> bool { forall|m: nat| #[trigger] code_gwin4(crs, isr, m) }
+pub open spec fn cfg_eq_from(cs: spec_fn(nat) -> Cfg, K: nat) -> bool {
+    forall|j: nat| j >= K ==> a_doc(#[trigger] cs(j).a[0]) == a_doc(cs(j).a[1])
+}
+
+// a code step keeps cfg_wf and the shared deps function and bound
+pub proof fn lemma_code_step_dn(c: Cfg, c2: Cfg)
+    requires cfg_wf(c), code_next(c, c2), ensures cfg_wf(c2), cfg_d(c2) == cfg_d(c), cfg_n(c2) == cfg_n(c),
+{
+    lemma_code_step(c, c2);
+    let (who, keep0) = choose|who: int, keep: bool| step_any(c, c2, who, keep);
+    assert(cfg_peer_ok(c, who));
+    if step_recv(c, c2, who, keep0) {
+        let (msg, a1, s1) = choose|msg: Message, a1: Automerge, s1: State| recv_rel(c, c2, who, keep0, msg, a1, s1);
+        assert(c2.a == c.a.update(who, a1));
+        assert(a_deps(a1) == a_deps(c.a[who]) && a_n(a1) == a_n(c.a[who]));
+        assert(c2.a[who] == a1);
+    } else if step_edit(c, c2, who) && !step_gen(c, c2, who) && !step_tmo(c, c2, who) && !step_drop(c, c2, who) {
+        let (a1, ch) = choose|a1: Automerge, ch: int| edit_rel(c, c2, who, a1, ch);
+        assert(c2.a == c.a.update(who, a1));
+        assert(c2.a[who] == a1);
+    } else {
+        if step_gen(c, c2, who) { let (s1, r) = choose|s1: State, r: Option<Message>| gen_rel(c, c2, who, s1, r); }
+        if step_tmo(c, c2, who) { let s1 = choose|s1: State| tmo_rel(c, c2, who, s1); }
+        if step_drop(c, c2, who) { let m = choose|m: M::Msg| drop_rel(c, c2, who, m); }
+        assert(c2.a == c.a);
+    }
+    assert(cfg_d(c2) == cfg_d(c) && cfg_n(c2) == cfg_n(c)) by {
+        assert(cfg_peer_ok(c, 0) && cfg_peer_ok(c, 1));
+        assert(a_deps(c2.a[who]) == a_deps(c.a[who]) && a_n(c2.a[who]) == a_n(c.a[who]));
+        if who != 0 { assert(c2.a[0] == c.a[0]); }
+    }
+}
+pub proof fn lemma_blocks_wf(cs: spec_fn(nat) -> Cfg, crs: spec_fn(nat) -> CRound, isr: spec_fn(nat) -> bool, k: nat)
+    requires cfg_wf(cs(0)), code_blocks(cs, crs, isr),
+    ensures cfg_wf(cs(k)), cfg_d(cs(k)) == cfg_d(cs(0)), cfg_n(cs(k)) == cfg_n(cs(0)),
+    decreases k,
+{
+    if k > 0 {
+        let j = (k - 1) as nat;
+        lemma_blocks_wf(cs, crs, isr, j);
+        assert(code_blk(cs(j), cs((j + 1) as nat), isr(j), crs(j)));
+        if isr(j) { lemma_round_code(cs(j), cs(k), crs(j)); } else { lemma_code_step_dn(cs(j), cs(k)); }
+    }
+}
+pub open spec fn blk_rp(cs: spec_fn(nat) -> Cfg, crs: spec_fn(nat) -> CRound, k: nat) -> M::RP {
+    choose|rp: M::RP| M::rvalid(cfg_d(cs(k)), cfg_n(cs(k)), abs_cfg(cs(k)), rp)
+        && abs_cfg(cs((k + 1) as nat)) == M::rw6(cfg_d(cs(k)), cfg_n(cs(k)), abs_cfg(cs(k)), rp) && (M::good(rp) <==> cr_good(crs(k)))
+}
+pub open spec fn blk_st(cs: spec_fn(nat) -> Cfg, k: nat) -> M::Step {
+    choose|st: M::Step| #[trigger] M::next(cfg_d(cs(k)), cfg_n(cs(k)), abs_cfg(cs(k)), st, abs_cfg(cs((k + 1) as nat)))
+}
+// each code block is a model block (round with the chosen RP, or the chosen single step)
+proof fn lemma_blk_model(cs: spec_fn(nat) -> Cfg, crs: spec_fn(nat) -> CRound, isr: spec_fn(nat) -> bool, k: nat)
+    requires cfg_wf(cs(0)), code_blocks(cs, crs, isr),
+    ensures M::eblk_ok(cfg_d(cs(0)), cfg_n(cs(0)), abs_cfg(cs(k)), isr(k), blk_rp(cs, crs, k), blk_st(cs, k), abs_cfg(cs((k + 1) as nat))),
+        isr(k) ==> (M::good(blk_rp(cs, crs, k)) <==> cr_good(crs(k))),
+{
+    lemma_blocks_wf(cs, crs, isr, k);
+    assert(code_blk(cs(k), cs((k + 1) as nat), isr(k), crs(k)));
+    if isr(k) {
+        lemma_round_code(cs(k), cs((k + 1) as nat), crs(k));
+        let rp = blk_rp(cs, crs, k);
+        assert(M::rvalid(cfg_d(cs(k)), cfg_n(cs(k)), abs_cfg(cs(k)), rp));
+    } else {
+        lemma_code_step(cs(k), cs((k + 1) as nat));
+        let st = blk_st(cs, k);
+        assert(M::next(cfg_d(cs(k)), cfg_n(cs(k)), abs_cfg(cs(k)), st, abs_cfg(cs((k + 1) as nat))));
+    }
+}
+// THEOREM (liveness of the code with edits).  Start: live_start.  Run: any sequence of blocks, each a code round or
+// one code step (a local edit among them), any number of edits at any time.  Fairness: infinitely often 4
+// consecutive blocks are loss-free rounds.  Then there is K such that for all j >= K the documents are equal.
+// Assumed as in Part E, plus: the local edit conforms to the model's Edit (`edit_rel`, trusted).
+pub proof fn theorem_code_liveness_edits(cs: spec_fn(nat) -> Cfg, crs: spec_fn(nat) -> CRound, isr: spec_fn(nat) -> bool)
+    requires live_start(cs(0)), code_blocks(cs, crs, isr), code_gfair(crs, isr),
+    ensures exists|K: nat| #[trigger] cfg_eq_from(cs, K),
+{
+    let d = cfg_d(cs(0)); let n = cfg_n(cs(0));
+    let ws = |k: nat| abs_cfg(cs(k));
+    let rps = |k: nat| blk_rp(cs, crs, k);
+    let sts = |k: nat| blk_st(cs, k);
+    lemma_live_start_sinv(cs(0));
+    assert(M::wf(d, n)) by { assert(cfg_peer_ok(cs(0), 0)); assert(a_wf(cs(0).a[0])); }
+    assert forall|k: nat| #![trigger rps(k)] M::eblk_ok(d, n, ws(k), isr(k), rps(k), sts(k), ws((k + 1) as nat)) by {
+        lemma_blk_model(cs, crs, isr, k);
+    }
+    assert(M::egrun_ok(d, n, ws, isr, rps, sts));
+    assert forall|m: nat| #[trigger] M::gwin4(isr, rps, m) by {
+        assert(code_gwin4(crs, isr, m));
+        let k = choose|k: nat| #![trigger crs(k)] k >= m && cgr(crs, isr, k) && cgr(crs, isr, (k + 1) as nat)
+            && cgr(crs, isr, (k + 2) as nat) && cgr(crs, isr, (k + 3) as nat);
+        lemma_blk_model(cs, crs, isr, k); lemma_blk_model(cs, crs, isr, (k + 1) as nat);
+        lemma_blk_model(cs, crs, isr, (k + 2) as nat); lemma_blk_model(cs, crs, isr, (k + 3) as nat);
+        let _ = rps(k); let _ = rps((k + 1) as nat); let _ = rps((k + 2) as nat); let _ = rps((k + 3) as nat);
+        assert(M::gr(isr, rps, k) && M::gr(isr, rps, (k + 1) as nat) && M::gr(isr, rps, (k + 2) as nat) && M::gr(isr, rps, (k + 3) as nat));
+    }
+    assert(M::gfair(isr, rps));
+    M::theorem_edits_liveness_sinv(d, n, ws, isr, rps, sts);
+    let K = choose|K: nat| #[trigger] M::eq_from(ws, K);
+    assert(cfg_eq_from(cs, K)) by {
+        assert forall|j: nat| j >= K implies a_doc(#[trigger] cs(j).a[0]) == a_doc(cs(j).a[1]) by { assert(ws(j).peers[0].doc == ws(j).peers[1].doc); }
+    }
+}
+
 } // verus!
